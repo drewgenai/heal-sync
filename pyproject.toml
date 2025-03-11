@@ -1,0 +1,38 @@
+[project]
+name = "protocol-sync"
+version = "0.1.0"
+description = "midterm POC huggingface project"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+"IProgress",
+"PyMuPDF",
+"accelerate",
+"chainlit",
+"huggingface_hub",
+"ipykernel",
+"ipywidgets",
+"langchain",
+"langchain-community",
+"langchain-core",
+"langchain-experimental",
+"langchain-huggingface",
+"langchain-openai",
+"langchain-qdrant",
+"langchain-text-splitters",
+"langgraph",
+"langsmith",
+"lxml",
+"openai",
+"pymupdf",
+"pypdf2",
+"qdrant-client",
+"ragas",
+"torch",
+"transformers",
+"tqdm",
+"unstructured",
+"wandb",
+"websockets",
+"openpyxl",
+]
