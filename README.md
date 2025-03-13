@@ -1,5 +1,5 @@
 ---
-title: Protocol Sync
+title: Heal Sync
 emoji: 🔥
 colorFrom: blue
 colorTo: yellow
