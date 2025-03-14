@@ -26,7 +26,7 @@ load_dotenv()
 
 UPLOAD_PATH = "upload/"
 OUTPUT_PATH = "output/"
-INITIAL_DATA_PATH = "./data/Instruments_Definitions.xlsx"
+DATA_PATH = "./data/"
 os.makedirs(UPLOAD_PATH, exist_ok=True)
 os.makedirs(OUTPUT_PATH, exist_ok=True)
 
@@ -210,9 +210,8 @@ def initialize_vector_store():
         # Create a Qdrant client for in-memory storage
         client = QdrantClient(location=":memory:")
         
-        # Create the collection with the appropriate vector size
         # Snowflake/snowflake-arctic-embed-m produces 768-dimensional vectors
-        vector_size = 768  # Changed from 1536 to match your embedding model
+        vector_size = 768
         
         # Check if collection exists, if not create it
         collections = client.get_collections().collections
@@ -239,28 +238,43 @@ def initialize_vector_store():
 
 
 async def load_reference_data(vectorstore):
-    """Load reference Excel data into the vector database"""
-    if not os.path.exists(INITIAL_DATA_PATH):
-        print(f"Warning: Initial data file {INITIAL_DATA_PATH} not found")
+    """Load all Excel files from the data directory into the vector database"""
+    if not os.path.exists(DATA_PATH):
+        print(f"Warning: Data directory {DATA_PATH} not found")
         return vectorstore
     
     try:
-        # Load Excel file
-        df = pd.read_excel(INITIAL_DATA_PATH)
+        # Get all Excel files in the data directory
+        excel_files = [f for f in os.listdir(DATA_PATH) if f.endswith('.xlsx') or f.endswith('.xls')]
         
-        # Convert DataFrame to documents
-        documents = []
-        for _, row in df.iterrows():
-            # Combine all columns into a single text
-            content = " ".join([f"{col}: {str(val)}" for col, val in row.items()])
-            doc = Document(page_content=content, metadata={"source": "Instruments_Definitions.xlsx"})
-            documents.append(doc)
+        if not excel_files:
+            print(f"Warning: No Excel files found in {DATA_PATH}")
+            return vectorstore
         
-        # Add documents to vector store
-        if documents:
-            vectorstore.add_documents(documents)
-            print(f"Successfully loaded {len(documents)} entries from {INITIAL_DATA_PATH}")
+        total_documents = 0
         
+        # Process each Excel file
+        for excel_file in excel_files:
+            file_path = os.path.join(DATA_PATH, excel_file)
+            
+            # Load Excel file
+            df = pd.read_excel(file_path)
+            
+            # Convert DataFrame to documents
+            documents = []
+            for _, row in df.iterrows():
+                # Combine all columns into a single text
+                content = " ".join([f"{col}: {str(val)}" for col, val in row.items()])
+                doc = Document(page_content=content, metadata={"source": excel_file})
+                documents.append(doc)
+            
+            # Add documents to vector store
+            if documents:
+                vectorstore.add_documents(documents)
+                total_documents += len(documents)
+                print(f"Successfully loaded {len(documents)} entries from {excel_file}")
+        
+        print(f"Total entries loaded: {total_documents} from {len(excel_files)} files")
         return vectorstore
     except Exception as e:
         print(f"Error loading reference data: {str(e)}")
