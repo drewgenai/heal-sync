@@ -2,7 +2,7 @@ import os
 import shutil
 import json
 import pandas as pd
-import chainlit as cl
+import streamlit as st
 from dotenv import load_dotenv
 from langchain_core.documents import Document
 from langchain_community.document_loaders import PyMuPDFLoader
@@ -23,6 +23,15 @@ from qdrant_client.models import VectorParams, Distance
 
 load_dotenv()
 
+# Initialize session state if not already done
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+if "qdrant_vectorstore" not in st.session_state:
+    st.session_state.qdrant_vectorstore = None
+if "qdrant_retriever" not in st.session_state:
+    st.session_state.qdrant_retriever = None
+if "files_processed" not in st.session_state:
+    st.session_state.files_processed = False
 
 UPLOAD_PATH = "upload/"
 OUTPUT_PATH = "output/"
@@ -104,7 +113,7 @@ query_prompt = ChatPromptTemplate.from_template(QUERY_PROMPT)
 def document_query_tool(question: str) -> str:
     """Retrieves relevant document sections and answers questions based on the uploaded documents."""
 
-    retriever = cl.user_session.get("qdrant_retriever")
+    retriever = st.session_state.qdrant_retriever
     if not retriever:
         return "Error: No documents available for retrieval. Please upload two PDF files first."
     retriever = retriever.with_config({"k": 10})
@@ -130,7 +139,7 @@ def document_comparison_tool(question: str) -> str:
     """Compares the two uploaded documents, identifies matched elements, exports them as JSON, formats into CSV, and provides a download link."""
 
     # Retrieve the vector database retriever
-    retriever = cl.user_session.get("qdrant_retriever")
+    retriever = st.session_state.qdrant_retriever
     if not retriever:
         return "Error: No documents available for retrieval. Please upload two PDF files first."
     
@@ -157,16 +166,11 @@ def document_comparison_tool(question: str) -> str:
         df = pd.DataFrame(structured_data, columns=["Derived Description", "Protocol_1", "Protocol_2"])
         df.to_csv(file_path, index=False)
 
-        # Send the message with the file directly from the tool
-        cl.run_sync(
-            cl.Message(
-                content="Comparison complete! Download the CSV below:",
-                elements=[cl.File(name="comparison_results.csv", path=file_path, display="inline")],
-            ).send()
-        )
+        # In Streamlit, we'll handle the file download in the main app flow
+        st.session_state.comparison_results = file_path
         
         # Return a simple confirmation message
-        return "Comparison results have been generated and displayed."
+        return "Comparison results have been generated and are ready for download."
 
     except json.JSONDecodeError:
         return "Error: Response is not valid JSON."
@@ -240,7 +244,7 @@ def initialize_vector_store():
         return None
 
 
-async def load_reference_data(vectorstore):
+def load_reference_data(vectorstore):
     """Load all Excel files from the data directory into the vector database"""
     if not os.path.exists(DATA_PATH):
         print(f"Warning: Data directory {DATA_PATH} not found")
@@ -274,9 +278,9 @@ async def load_reference_data(vectorstore):
                 doc = Document(page_content=content, metadata={"source": file_name})
                 documents.append(doc)
             
-            # Add documents to vector store - make this properly async
+            # Add documents to vector store
             if documents:
-                await cl.make_async(vectorstore.add_documents)(documents)
+                vectorstore.add_documents(documents)
                 total_documents += len(documents)
                 print(f"Successfully loaded {len(documents)} entries from {file_name}")
         
@@ -291,14 +295,17 @@ async def load_reference_data(vectorstore):
         return vectorstore
 
 
-async def process_uploaded_files(files, vectorstore):
+def process_uploaded_files(files, vectorstore):
     """Process uploaded PDF files and add them to the vector store"""
     print(f"Processing {len(files)} uploaded files")
     documents_with_metadata = []
     for file in files:
         print(f"Processing file: {file.name}, size: {file.size} bytes")
         file_path = os.path.join(UPLOAD_PATH, file.name)
-        shutil.copyfile(file.path, file_path)
+        
+        # Save the uploaded file
+        with open(file_path, "wb") as f:
+            f.write(file.getbuffer())
         
         loader = PyMuPDFLoader(file_path)
         documents = loader.load()
@@ -311,81 +318,106 @@ async def process_uploaded_files(files, vectorstore):
                 documents_with_metadata.append(doc_chunk)
     
     if documents_with_metadata:
-        # Add documents to vector store - make this properly async
-        await cl.make_async(vectorstore.add_documents)(documents_with_metadata)
+        # Add documents to vector store
+        vectorstore.add_documents(documents_with_metadata)
         print(f"Added {len(documents_with_metadata)} chunks from uploaded files")
         return True
     return False
 
 
-@cl.on_chat_start
-async def start():
-    # Initialize chat history for the agent
-    cl.user_session.set("chat_history", [])
-    
-    # Initialize vector store
-    vectorstore = initialize_vector_store()
-    if not vectorstore:
-        await cl.Message("Error: Could not initialize vector store.").send()
-        return
-    
-    # Load reference data
-    with cl.Step("Loading reference data"):
-        vectorstore = await load_reference_data(vectorstore)
-        cl.user_session.set("qdrant_vectorstore", vectorstore)
-        cl.user_session.set("qdrant_retriever", vectorstore.as_retriever())
-        await cl.Message("Reference data loaded successfully!").send()
-    
-    # Now wait for user to upload files
-    files = await cl.AskFileMessage(
-        content="I'm ready to help you analyze documents. Please upload two PDF files for comparison:",
-        accept=["application/pdf"],
-        max_files=2,
-        timeout=3600  # Give users plenty of time to upload files
-    ).send()
-    
-    if not files:
-        await cl.Message("No files were uploaded. You can send a message to continue.").send()
-        return
-        
-    if len(files) != 2:
-        await cl.Message("Please upload exactly two PDF files for comparison.").send()
-        return
-    
-    # Process uploaded files
-    with cl.Step("Processing uploaded files"):
-        success = await process_uploaded_files(files, vectorstore)
-        if success:
-            # Update the retriever with the latest vector store
-            cl.user_session.set("qdrant_retriever", vectorstore.as_retriever())
-            await cl.Message("Files uploaded and processed successfully! You can now enter your query.").send()
+# Streamlit UI
+st.title("Document Analysis Assistant")
+
+# Initialize vector store on first run
+if st.session_state.qdrant_vectorstore is None:
+    with st.spinner("Initializing vector store..."):
+        vectorstore = initialize_vector_store()
+        if vectorstore:
+            st.session_state.qdrant_vectorstore = vectorstore
+            vectorstore = load_reference_data(vectorstore)
+            st.session_state.qdrant_retriever = vectorstore.as_retriever()
+            st.success("Reference data loaded successfully!")
         else:
-            await cl.Message("Error: Unable to process files. Please try again.").send()
+            st.error("Error: Could not initialize vector store.")
 
+# File upload section
+if not st.session_state.files_processed:
+    st.write("Please upload two PDF files for comparison:")
+    uploaded_files = st.file_uploader("Upload PDF files", type="pdf", accept_multiple_files=True)
+    
+    if uploaded_files and len(uploaded_files) == 2:
+        if st.button("Process Files"):
+            with st.spinner("Processing uploaded files..."):
+                success = process_uploaded_files(uploaded_files, st.session_state.qdrant_vectorstore)
+                if success:
+                    # Update the retriever with the latest vector store
+                    st.session_state.qdrant_retriever = st.session_state.qdrant_vectorstore.as_retriever()
+                    st.session_state.files_processed = True
+                    st.success("Files uploaded and processed successfully! You can now enter your query.")
+                    st.rerun()
+                else:
+                    st.error("Error: Unable to process files. Please try again.")
+    elif uploaded_files and len(uploaded_files) != 2:
+        st.warning("Please upload exactly two PDF files for comparison.")
 
-@cl.on_message
-async def handle_message(message: cl.Message):
-    # Get chat history
-    chat_history = cl.user_session.get("chat_history", [])
+# Chat interface
+if st.session_state.files_processed:
+    # Display chat history
+    for message in st.session_state.chat_history:
+        if isinstance(message, HumanMessage):
+            with st.chat_message("user"):
+                st.write(message.content)
+        else:
+            with st.chat_message("assistant"):
+                st.write(message)
+                
+                # If there are comparison results to download
+                if "comparison_results" in st.session_state and isinstance(message, str) and "Comparison results have been generated" in message:
+                    with open(st.session_state.comparison_results, "rb") as file:
+                        st.download_button(
+                            label="Download Comparison Results",
+                            data=file,
+                            file_name="comparison_results.csv",
+                            mime="text/csv"
+                        )
     
-    # Run the agent
-    with cl.Step("Agent thinking"):
-        response = await cl.make_async(agent_executor.invoke)(
-            {"input": message.content, "chat_history": chat_history}
-        )
+    # Input for new message
+    user_input = st.chat_input("Type your message here...")
     
-    # Handle the response based on the tool that was called
-    if isinstance(response["output"], dict) and "messages" in response["output"]:
-        # This is from document_query_tool
-        await cl.Message(response["output"]["messages"][0].content).send()
-    else:
-        # Generic response (including the confirmation from document_comparison_tool)
-        await cl.Message(content=str(response["output"])).send()
-    
-    # Update chat history with the new exchange
-    chat_history.extend([
-        HumanMessage(content=message.content),
-        HumanMessage(content=str(response["output"]))
-    ])
-    cl.user_session.set("chat_history", chat_history)
+    if user_input:
+        # Display user message
+        with st.chat_message("user"):
+            st.write(user_input)
+        
+        # Add to history
+        st.session_state.chat_history.append(HumanMessage(content=user_input))
+        
+        # Process with agent
+        with st.spinner("Thinking..."):
+            response = agent_executor.invoke(
+                {"input": user_input, "chat_history": st.session_state.chat_history}
+            )
+        
+        # Display assistant response
+        with st.chat_message("assistant"):
+            if isinstance(response["output"], dict) and "messages" in response["output"]:
+                # This is from document_query_tool
+                st.write(response["output"]["messages"][0].content)
+                # Store the response in chat history
+                st.session_state.chat_history.append(response["output"]["messages"][0].content)
+            else:
+                # Generic response (including the confirmation from document_comparison_tool)
+                st.write(response["output"])
+                # Store the response in chat history
+                st.session_state.chat_history.append(response["output"])
+                
+                # If there are comparison results to download
+                if "comparison_results" in st.session_state and "Comparison results have been generated" in response["output"]:
+                    with open(st.session_state.comparison_results, "rb") as file:
+                        st.download_button(
+                            label="Download Comparison Results",
+                            data=file,
+                            file_name="comparison_results.csv",
+                            mime="text/csv"
+                        )
     

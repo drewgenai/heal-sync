@@ -35,4 +35,5 @@ dependencies = [
 "wandb",
 "websockets",
 "openpyxl",
+"streamlit",
 ]
