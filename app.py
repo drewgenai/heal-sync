@@ -200,17 +200,26 @@ async def process_uploaded_files(files, model_name=PDF_MODEL_ID):
 # Data processing and initialization
 vectorstore = process_initial_embeddings()
 
-
-# Create a retriever from the vector store
+# Create retrievers for each collection
 if vectorstore:
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
-    print("Retriever created successfully.")
+    # Retriever for initial Excel embeddings
+    excel_retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
+    print("Excel retriever created successfully.")
 else:
-    print("Failed to create retriever: No vector store available.")
+    print("Failed to create Excel retriever: No vector store available.")
 
-naive_retriever = vectorstore.as_retriever(search_kwargs={"k" : 10})
+# The PDF retriever is created dynamically when files are uploaded
+# in the embed_pdf_chunks_in_qdrant function:
+#
+# user_vectorstore = QdrantVectorStore(
+#     client=qdrant_client,
+#     collection_name=USER_EMBEDDINGS_NAME,
+#     embedding=pdf_model
+# )
+# 
+# user_retriever = user_vectorstore.as_retriever(search_kwargs={"k": top_k})
 
-# RAG setup
+# RAG setup for Excel data
 RAG_TEMPLATE = """\
 You are a helpful and kind assistant. Use the context provided below to answer the question.
 
@@ -227,8 +236,9 @@ rag_prompt = ChatPromptTemplate.from_template(RAG_TEMPLATE)
 
 chat_model = ChatOpenAI()
 
+# Chain for retrieving from Excel embeddings
 initialembeddings_retrieval_chain = (
-    {"context": itemgetter("question") | retriever | format_docs, 
+    {"context": itemgetter("question") | excel_retriever | format_docs, 
      "question": itemgetter("question")}
     | rag_prompt 
     | chat_model
