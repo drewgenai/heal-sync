@@ -1,8 +1,18 @@
 # Get a distribution that has uv already installed
 FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim
 
+# Install required system dependencies for building packages
+USER root
+RUN apt-get update && apt-get install -y \
+    g++ \
+    gcc \
+    python3-dev \
+    libssl-dev \
+    libffi-dev \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
 # Add user - this is the user that will run the app
-# If you do not set user, the app will run as root (undesirable)
 RUN useradd -m -u 1000 user
 USER user
 
@@ -12,7 +22,6 @@ ENV HOME=/home/user \
 
 ENV UVICORN_WS_PROTOCOL=websockets
 
-
 # Set the working directory
 WORKDIR $HOME/app
 
@@ -20,8 +29,11 @@ WORKDIR $HOME/app
 COPY --chown=user . $HOME/app
 
 # Install the dependencies
-# RUN uv sync --frozen
 RUN uv sync
+
+# Ensure NLTK is available inside the uv virtual environment and download required data
+RUN uv pip install nltk \
+    && uv run python3 -m nltk.downloader punkt punkt_tab
 
 # Expose the port
 EXPOSE 7860

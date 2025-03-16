@@ -36,4 +36,7 @@ dependencies = [
 "websockets",
 "openpyxl",
 "streamlit",
+"sentence-transformers",
+"snowflake-connector-python",
+"nltk",
 ]

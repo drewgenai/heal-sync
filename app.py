@@ -1,391 +1,497 @@
 import os
-import shutil
-import json
-import pandas as pd
-import chainlit as cl
-from dotenv import load_dotenv
-from langchain_core.documents import Document
-from langchain_community.document_loaders import PyMuPDFLoader
-from langchain_experimental.text_splitter import SemanticChunker
-from langchain_qdrant import QdrantVectorStore
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_core.output_parsers import StrOutputParser
-from langchain_openai import ChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate
-from langchain.tools import tool
-from langchain.schema import HumanMessage
-from typing_extensions import List, TypedDict
-from operator import itemgetter
-from langchain.agents import AgentExecutor, create_openai_tools_agent
-from langchain_core.prompts import MessagesPlaceholder
-from qdrant_client import QdrantClient
-from qdrant_client.models import VectorParams, Distance
+from typing import Annotated, Literal
+from typing_extensions import TypedDict
 
+import chainlit as cl
+import numpy as np
+import pandas as pd
+import shutil
+
+from dotenv import load_dotenv
+from langchain.schema.runnable.config import RunnableConfig
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import UnstructuredExcelLoader, PyMuPDFLoader
+from langchain_qdrant import QdrantVectorStore
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.tools import tool
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_openai import ChatOpenAI
+from langgraph.graph import END, StateGraph, START
+from langgraph.graph.message import MessagesState
+from langgraph.prebuilt import ToolNode
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams
+from langchain_core.documents import Document
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from operator import itemgetter
+from langchain_core.output_parsers import StrOutputParser
+
+# Load environment variables
 load_dotenv()
 
+# Constants
+INITIAL_EMBEDDINGS_DIR = "./initial_embeddings"
+INITIAL_EMBEDDINGS_NAME = "initial_embeddings"
+XLSX_MODEL_ID = "Snowflake/snowflake-arctic-embed-m"
+UPLOAD_PATH = "./uploads"
+USER_EMBEDDINGS_NAME = "user_embeddings"
 
-UPLOAD_PATH = "upload/"
-OUTPUT_PATH = "output/"
-DATA_PATH = "./data/"
+# NIH HEAL CDE core domains
+NIH_HEAL_DOMAINS = [
+    "Pain intensity",
+    "Pain interference",
+    "Physical functioning/quality of life (QoL)",
+    "Sleep",
+    "Pain catastrophizing",
+    "Depression",
+    "Anxiety",
+    "Global satisfaction with treatment",
+    "Substance Use Screener",
+    "Quality of Life (QoL)"
+]
+
+# Initialize Qdrant (in-memory)
+qdrant_client = QdrantClient(":memory:")
+
+# Make sure upload directory exists
 os.makedirs(UPLOAD_PATH, exist_ok=True)
-os.makedirs(OUTPUT_PATH, exist_ok=True)
 
-# Initialize embeddings model
-model_id = "Snowflake/snowflake-arctic-embed-m"
-embedding_model = HuggingFaceEmbeddings(model_name=model_id)
-semantic_splitter = SemanticChunker(embedding_model, add_start_index=True, buffer_size=30)
-llm = ChatOpenAI(model="gpt-4o-mini")
+# Create a semantic splitter for PDF documents
+semantic_splitter = RecursiveCharacterTextSplitter(chunk_size=512, chunk_overlap=50)
 
-# Export comparison prompt
-export_prompt = """
-CONTEXT:
-{context}
+# Utility functions
+def process_initial_embeddings():
+    """Loads all .xlsx files, extracts text, embeds, and stores in Qdrant."""
 
-QUERY:
-{question}
+    xlsx_model = HuggingFaceEmbeddings(model_name=XLSX_MODEL_ID)
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=512, chunk_overlap=50)
 
-You are a helpful assistant. Use the available context to answer the question.
-
-Between these two files containing protocols, identify and match **entire assessment sections** based on conceptual similarity. Do NOT match individual questions.
-
-### **Output Format:**
-Return the response in **valid JSON format** structured as a list of dictionaries, where each dictionary contains:
-[
-    {{
-        "Derived Description": "A short name for the matched concept",
-        "Protocol_1": "Protocol 1 - Matching Element",
-        "Protocol_2": "Protocol 2 - Matching Element"
-    }},
-    ...
-]
-### **Example Output:**
-[
-    {{
-        "Derived Description": "Pain Coping Strategies",
-        "Protocol_1": "Pain Coping Strategy Scale (PCSS-9)",
-        "Protocol_2": "Chronic Pain Adjustment Index (CPAI-10)"
-    }},
-    {{
-        "Derived Description": "Work Stress and Fatigue",
-        "Protocol_1": "Work-Related Stress Scale (WRSS-8)",
-        "Protocol_2": "Occupational Fatigue Index (OFI-7)"
-    }},
-    ...
-]
-
-### Rules:
-1. Only output **valid JSON** with no explanations, summaries, or markdown formatting.
-2. Ensure each entry in the JSON list represents a single matched data element from the two protocols.
-3. If no matching element is found in a protocol, leave it empty ("").
-4. **Do NOT include headers, explanations, or additional formatting**—only return the raw JSON list.
-5. It should include all the elements in the two protocols.
-6. If it cannot match the element, create the row and include the protocol it did find and put "could not match" in the other protocol column.
-7. protocol should be the between
-"""
-
-compare_export_prompt = ChatPromptTemplate.from_template(export_prompt)
-
-QUERY_PROMPT = """
-You are a helpful assistant. Use the available context to answer the question concisely and informatively.
-
-CONTEXT:
-{context}
-
-QUERY:
-{question}
-
-Provide a natural-language response using the given information. If you do not know the answer, say so.
-"""
-
-query_prompt = ChatPromptTemplate.from_template(QUERY_PROMPT)
-
-
-@tool
-def document_query_tool(question: str) -> str:
-    """Retrieves relevant document sections and answers questions based on the uploaded documents."""
-
-    retriever = cl.user_session.get("qdrant_retriever")
-    if not retriever:
-        return "Error: No documents available for retrieval. Please upload two PDF files first."
-    retriever = retriever.with_config({"k": 10})
-
-    # Use a RAG chain similar to the comparison tool
-    rag_chain = (
-        {"context": itemgetter("question") | retriever, "question": itemgetter("question")}
-        | query_prompt | llm | StrOutputParser()
-    )
-    response_text = rag_chain.invoke({"question": question})
-
-    # Get the retrieved docs for context
-    retrieved_docs = retriever.invoke(question)
-
-    return {
-        "messages": [HumanMessage(content=response_text)],
-        "context": retrieved_docs
-    }
-
-
-@tool
-def document_comparison_tool(question: str) -> str:
-    """Compares the two uploaded documents, identifies matched elements, exports them as JSON, formats into CSV, and provides a download link."""
-
-    # Retrieve the vector database retriever
-    retriever = cl.user_session.get("qdrant_retriever")
-    if not retriever:
-        return "Error: No documents available for retrieval. Please upload two PDF files first."
+    all_chunks = []
+    file_count = 0
     
-    # Set k=10 to match the document_query_tool
-    retriever = retriever.with_config({"k": 10})
-
-    # Process query using RAG
-    rag_chain = (
-        {"context": itemgetter("question") | retriever, "question": itemgetter("question")}
-        | compare_export_prompt | llm | StrOutputParser()
-    )
-    response_text = rag_chain.invoke({"question": question})
-
-    # Parse response and save as CSV
-    try:
-        structured_data = json.loads(response_text)
-        if not structured_data:
-            return "Error: No matched elements found."
-
-        # Define output file path
-        file_path = os.path.join(OUTPUT_PATH, "comparison_results.csv")
-
-        # Save to CSV
-        df = pd.DataFrame(structured_data, columns=["Derived Description", "Protocol_1", "Protocol_2"])
-        df.to_csv(file_path, index=False)
-
-        # Send the message with the file directly from the tool
-        cl.run_sync(
-            cl.Message(
-                content="Comparison complete! Download the CSV below:",
-                elements=[cl.File(name="comparison_results.csv", path=file_path, display="inline")],
-            ).send()
-        )
-        
-        # Return a simple confirmation message
-        return "Comparison results have been generated and displayed."
-
-    except json.JSONDecodeError:
-        return "Error: Response is not valid JSON."
-
-
-# Define tools for the agent
-tools = [document_query_tool, document_comparison_tool]
-
-# Set up the agent with a system prompt
-system_prompt = """You are an intelligent document analysis assistant. You have access to two tools:
-
-1. document_query_tool: Use this when a user wants information or has questions about the content of uploaded documents.
-2. document_comparison_tool: Use this when a user wants to compare elements between two uploaded documents or export comparison results.
-
-Analyze the user's request carefully to determine which tool is most appropriate.
-"""
-
-# Create the agent using OpenAI function calling
-agent_prompt = ChatPromptTemplate.from_messages([
-    ("system", system_prompt),
-    MessagesPlaceholder(variable_name="chat_history"),
-    ("human", "{input}"),
-    MessagesPlaceholder(variable_name="agent_scratchpad"),
-])
-
-agent = create_openai_tools_agent(
-    llm=ChatOpenAI(model="gpt-4o", temperature=0),
-    tools=tools,
-    prompt=agent_prompt
-)
-
-# Create the agent executor
-agent_executor = AgentExecutor.from_agent_and_tools(
-    agent=agent,
-    tools=tools,
-    verbose=True,
-    handle_parsing_errors=True,
-)
-
-
-def initialize_vector_store():
-    """Initialize an empty Qdrant vector store"""
-    try:
-        # Create a Qdrant client for in-memory storage
-        client = QdrantClient(location=":memory:")
-        
-        # Snowflake/snowflake-arctic-embed-m produces 768-dimensional vectors
-        vector_size = 768
-        
-        # Check if collection exists, if not create it
-        collections = client.get_collections().collections
-        collection_names = [collection.name for collection in collections]
-        
-        if "document_comparison" not in collection_names:
-            client.create_collection(
-                collection_name="document_comparison",
-                vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE)
-            )
-            print("Created new collection: document_comparison")
-        
-        # Create the vector store with the client
-        vectorstore = QdrantVectorStore(
-            client=client,
-            collection_name="document_comparison",
-            embedding=embedding_model
-        )
-        print("Vector store initialized successfully")
-        return vectorstore
-    except Exception as e:
-        print(f"Error initializing vector store: {str(e)}")
+    print("Processing Excel files...")
+    
+    for file in os.listdir(INITIAL_EMBEDDINGS_DIR):
+        if file.endswith(".xlsx"):
+            file_path = os.path.join(INITIAL_EMBEDDINGS_DIR, file)
+            
+            try:
+                loader = UnstructuredExcelLoader(file_path)
+                documents = loader.load()
+                
+                chunks = text_splitter.split_documents(documents)
+                
+                for chunk in chunks:
+                    chunk.metadata = chunk.metadata or {}
+                    chunk.metadata["filename"] = file
+                
+                all_chunks.extend(chunks)
+                file_count += 1
+                print(f"Processed: {file} - {len(chunks)} chunks")
+                
+            except Exception as e:
+                print(f"Error processing {file}: {str(e)}")
+    
+    print(f"Processed {file_count} Excel files with a total of {len(all_chunks)} chunks.")
+    
+    # Create vector store with all documents at once
+    if not all_chunks:
+        print("No Excel files found to process or all files were empty.")
         return None
 
+    print("Creating vector store...")
+    vector_store = QdrantVectorStore.from_documents(
+        documents=all_chunks,
+        embedding=xlsx_model,
+        location=":memory:",
+        collection_name=INITIAL_EMBEDDINGS_NAME
+    )
+    print(f"Successfully loaded all .xlsx files into Qdrant collection '{INITIAL_EMBEDDINGS_NAME}'.")
+    return vector_store
 
-async def load_reference_data(vectorstore):
-    """Load all Excel files from the data directory into the vector database"""
-    if not os.path.exists(DATA_PATH):
-        print(f"Warning: Data directory {DATA_PATH} not found")
-        return vectorstore
-    
-    try:
-        # Get all Excel files in the data directory
-        excel_files = [f for f in os.listdir(DATA_PATH) if f.endswith(('.xlsx', '.xls'))]
-        
-        if not excel_files:
-            print(f"Warning: No Excel files found in {DATA_PATH}")
-            return vectorstore
-            
-        # Add a flag to track if we've already loaded these files
-        if hasattr(vectorstore, '_reference_data_loaded'):
-            print("Reference data already loaded, skipping...")
-            return vectorstore
-            
-        total_documents = 0
-        
-        # Process each Excel file
-        for file_name in excel_files:
-            file_path = os.path.join(DATA_PATH, file_name)
-            df = pd.read_excel(file_path)
-            
-            # Convert DataFrame to documents
-            documents = []
-            for _, row in df.iterrows():
-                # Combine all columns into a single text
-                content = " ".join([f"{col}: {str(val)}" for col, val in row.items()])
-                doc = Document(page_content=content, metadata={"source": file_name})
-                documents.append(doc)
-            
-            # Add documents to vector store - make this properly async
-            if documents:
-                await cl.make_async(vectorstore.add_documents)(documents)
-                total_documents += len(documents)
-                print(f"Successfully loaded {len(documents)} entries from {file_name}")
-        
-        print(f"Total entries loaded: {total_documents} from {len(excel_files)} files")
-        
-        # Mark that we've loaded the reference data
-        setattr(vectorstore, '_reference_data_loaded', True)
-        
-        return vectorstore
-    except Exception as e:
-        print(f"Error loading reference data: {str(e)}")
-        return vectorstore
+def format_docs(docs):
+    return "\n\n".join(doc.page_content for doc in docs)
 
-
-async def process_uploaded_files(files, vectorstore):
-    """Process uploaded PDF files and add them to the vector store"""
+async def process_uploaded_files(files, model_name=XLSX_MODEL_ID):
+    """Process uploaded PDF files and add them to a separate vector store collection"""
     print(f"Processing {len(files)} uploaded files")
     documents_with_metadata = []
+    
     for file in files:
         print(f"Processing file: {file.name}, size: {file.size} bytes")
         file_path = os.path.join(UPLOAD_PATH, file.name)
+        
+        # Ensure the upload directory exists
+        os.makedirs(UPLOAD_PATH, exist_ok=True)
+        
+        # Copy the file to the upload directory
         shutil.copyfile(file.path, file_path)
         
-        loader = PyMuPDFLoader(file_path)
-        documents = loader.load()
-        
-        for doc in documents:
-            source_name = file.name
-            chunks = semantic_splitter.split_text(doc.page_content)
-            for chunk in chunks:
-                doc_chunk = Document(page_content=chunk, metadata={"source": source_name})
-                documents_with_metadata.append(doc_chunk)
+        try:
+            loader = PyMuPDFLoader(file_path)
+            documents = loader.load()
+            
+            for doc in documents:
+                source_name = file.name
+                chunks = semantic_splitter.split_text(doc.page_content)
+                for chunk in chunks:
+                    doc_chunk = Document(page_content=chunk, metadata={"source": source_name})
+                    documents_with_metadata.append(doc_chunk)
+                    
+            print(f"Successfully processed {file.name}, extracted {len(documents_with_metadata)} chunks")
+        except Exception as e:
+            print(f"Error processing {file.name}: {str(e)}")
     
     if documents_with_metadata:
-        # Add documents to vector store - make this properly async
-        await cl.make_async(vectorstore.add_documents)(documents_with_metadata)
-        print(f"Added {len(documents_with_metadata)} chunks from uploaded files")
-        return True
-    return False
+        # Create a new embeddings model
+        pdf_model = HuggingFaceEmbeddings(model_name=model_name)
+        
+        # Create a new vector store collection for user uploads
+        try:
+            # First, check if collection exists and delete it if it does
+            if USER_EMBEDDINGS_NAME in [c.name for c in qdrant_client.get_collections().collections]:
+                qdrant_client.delete_collection(USER_EMBEDDINGS_NAME)
+                
+            # Create the collection with proper parameters
+            # Get the embedding dimension by creating a sample embedding
+            sample_text = "Sample text to determine embedding dimension"
+            sample_embedding = pdf_model.embed_query(sample_text)
+            embedding_dimension = len(sample_embedding)
+            
+            qdrant_client.create_collection(
+                collection_name=USER_EMBEDDINGS_NAME,
+                vectors_config=VectorParams(size=embedding_dimension, distance=Distance.COSINE)
+            )
+            
+            # Create the vector store
+            user_vectorstore = QdrantVectorStore(
+                client=qdrant_client,
+                collection_name=USER_EMBEDDINGS_NAME,
+                embedding=pdf_model
+            )
+            
+            # Add documents to the vector store
+            user_vectorstore.add_documents(documents_with_metadata)
+            
+            print(f"Added {len(documents_with_metadata)} chunks from uploaded files to collection '{USER_EMBEDDINGS_NAME}'")
+            return user_vectorstore
+        except Exception as e:
+            print(f"Error creating vector store: {str(e)}")
+            return None
+    return None
 
+# Data processing and initialization
+vectorstore = process_initial_embeddings()
 
+# Create a retriever from the vector store
+if vectorstore:
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
+    print("Retriever created successfully.")
+else:
+    print("Failed to create retriever: No vector store available.")
+
+naive_retriever = vectorstore.as_retriever(search_kwargs={"k" : 10})
+
+# RAG setup
+RAG_TEMPLATE = """\
+You are a helpful and kind assistant. Use the context provided below to answer the question.
+
+If you do not know the answer, or are unsure, say you don't know.
+
+Query:
+{question}
+
+Context:
+{context}
+"""
+
+rag_prompt = ChatPromptTemplate.from_template(RAG_TEMPLATE)
+
+chat_model = ChatOpenAI()
+
+initialembeddings_retrieval_chain = (
+    {"context": itemgetter("question") | retriever | format_docs, 
+     "question": itemgetter("question")}
+    | rag_prompt 
+    | chat_model
+    | StrOutputParser()
+)
+
+# Tool definitions
+@tool
+def search_excel_data(query: str, top_k: int = 3) -> str:
+    """Search both Excel data and user-uploaded PDF data for information related to the query.
+    
+    Args:
+        query: The search query
+        top_k: Number of results to return (default: 3)
+        
+    Returns:
+        String containing the search results with their content and source files
+    """
+    # Use the existing initialembeddings_retrieval_chain
+    result = initialembeddings_retrieval_chain.invoke({"question": query})
+    
+    # If we have a user collection, also search that
+    try:
+        user_vectorstore = QdrantVectorStore(
+            client=qdrant_client,
+            collection_name=USER_EMBEDDINGS_NAME,
+            embedding=HuggingFaceEmbeddings(model_name=XLSX_MODEL_ID)
+        )
+        
+        # Create a retrieval chain for user documents
+        user_retriever = user_vectorstore.as_retriever(search_kwargs={"k": top_k})
+        
+        user_retrieval_chain = (
+            {"context": itemgetter("question") | user_retriever | format_docs, 
+             "question": itemgetter("question")}
+            | rag_prompt 
+            | chat_model
+            | StrOutputParser()
+        )
+        
+        user_result = user_retrieval_chain.invoke({"question": query})
+        
+        # Combine results
+        return f"From Excel files:\n{result}\n\nFrom your uploaded PDF:\n{user_result}"
+    except Exception as e:
+        # If no user collection exists yet, just return Excel results
+        return result
+
+@tool
+def identify_heal_instruments(protocol_text: str = "") -> str:
+    """Identify instruments used in the protocol for each NIH HEAL CDE core domain.
+    
+    Args:
+        protocol_text: Optional text from the protocol to analyze
+        
+    Returns:
+        String containing identified instruments for each domain
+    """
+    # Check if user collection exists
+    try:
+        # Check if files exist in the upload directory
+        uploaded_files = [f for f in os.listdir(UPLOAD_PATH) if f.endswith('.pdf')]
+        
+        if not uploaded_files:
+            return "No protocol document has been uploaded yet."
+            
+        user_vectorstore = QdrantVectorStore(
+            client=qdrant_client,
+            collection_name=USER_EMBEDDINGS_NAME,
+            embedding=HuggingFaceEmbeddings(model_name=XLSX_MODEL_ID)
+        )
+        user_retriever = user_vectorstore.as_retriever(search_kwargs={"k": 10})
+    except Exception as e:
+        print(f"Error accessing user vector store: {str(e)}")
+        return "No protocol document has been uploaded yet or there was an error accessing it."
+    
+    # For each domain, search for relevant instruments
+    domain_instruments = {}
+    
+    for domain in NIH_HEAL_DOMAINS:
+        # Search for instruments related to this domain in the protocol
+        query = f"What instrument or measure is used for {domain} in the protocol?"
+        
+        # Retrieve relevant chunks from the protocol
+        try:
+            docs = user_retriever.invoke(query)
+            protocol_context = format_docs(docs)
+            
+            # Search for instruments in the Excel data that match this domain
+            excel_query = f"What are standard instruments or measures for {domain}?"
+            excel_instruments = initialembeddings_retrieval_chain.invoke({"question": excel_query})
+            
+            # Use the model to identify the most likely instrument for this domain
+            prompt = f"""
+            Based on the protocol information and known instruments, identify which instrument is being used for the domain: {domain}
+            
+            Protocol information:
+            {protocol_context}
+            
+            Known instruments for this domain:
+            {excel_instruments}
+            
+            Respond with only the name of the identified instrument. If you cannot identify a specific instrument, respond with "Not identified".
+            """
+            
+            instrument = chat_model.invoke([HumanMessage(content=prompt)]).content
+            domain_instruments[domain] = instrument.strip()
+            print(f"Identified instrument for {domain}: {instrument.strip()}")
+        except Exception as e:
+            print(f"Error identifying instrument for {domain}: {str(e)}")
+            domain_instruments[domain] = "Error during identification"
+    
+    # Format the results as a markdown table
+    result = "# NIH HEAL CDE Core Domains and Identified Instruments\n\n"
+    result += "| Domain | Protocol Instrument |\n"
+    result += "|--------|--------------------|\n"
+    
+    for domain, instrument in domain_instruments.items():
+        result += f"| {domain} | {instrument} |\n"
+    
+    return result
+
+tools = [search_excel_data, identify_heal_instruments]
+
+# LangGraph components
+model = ChatOpenAI(model_name="gpt-4o-mini", temperature=0)
+final_model = ChatOpenAI(model_name="gpt-4o-mini", temperature=0)
+
+# System message for the model
+system_message = """You are a helpful assistant specializing in NIH HEAL CDE protocols.
+
+You have access to:
+1. Excel data through the search_excel_data tool
+2. A tool to identify instruments in NIH HEAL protocols (identify_heal_instruments)
+
+WHEN TO USE TOOLS:
+- When users ask about instruments, measures, assessments, questionnaires, or scales in a protocol, use the identify_heal_instruments tool.
+- When users ask about data or information in the Excel files, use the search_excel_data tool.
+- For general questions about NIH HEAL CDE domains, use the search_excel_data tool.
+
+Be specific in your tool queries to get the most relevant information.
+Always use the appropriate tool before responding to questions about the protocol or Excel data.
+"""
+
+# Bind tools and configure models
+model = model.bind_tools(tools)
+final_model = final_model.with_config(tags=["final_node"])
+tool_node = ToolNode(tools=tools)
+
+def should_continue(state: MessagesState) -> Literal["tools", "final"]:
+    messages = state["messages"]
+    last_message = messages[-1]
+    # If the LLM makes a tool call, then we route to the "tools" node
+    if last_message.tool_calls:
+        return "tools"
+    # Otherwise, we stop (reply to the user)
+    return "final"
+
+def call_model(state: MessagesState):
+    messages = state["messages"]
+    # Add the system message at the beginning of the messages list
+    if messages and not any(isinstance(msg, SystemMessage) for msg in messages):
+        messages = [SystemMessage(content=system_message)] + messages
+    response = model.invoke(messages)
+    # We return a list, because this will get added to the existing list
+    return {"messages": [response]}
+
+def call_final_model(state: MessagesState):
+    messages = state["messages"]
+    last_ai_message = messages[-1]
+    response = final_model.invoke(
+        [
+            SystemMessage("Rewrite this in the voice of a helpful and kind assistant"),
+            HumanMessage(last_ai_message.content),
+        ]
+    )
+    # overwrite the last AI message from the agent
+    response.id = last_ai_message.id
+    return {"messages": [response]}
+
+# Build the graph
+builder = StateGraph(MessagesState)
+
+builder.add_node("agent", call_model)
+builder.add_node("tools", tool_node)
+builder.add_node("final", call_final_model)
+
+builder.add_edge(START, "agent")
+builder.add_conditional_edges(
+    "agent",
+    should_continue,
+)
+
+builder.add_edge("tools", "agent")
+builder.add_edge("final", END)
+
+graph = builder.compile()
+
+# Chainlit handlers
 @cl.on_chat_start
-async def start():
-    # Initialize chat history for the agent
-    cl.user_session.set("chat_history", [])
+async def on_chat_start():
+    # Welcome message
+    welcome_msg = cl.Message(content="Welcome! Please upload a NIH HEAL protocol PDF file to get started.")
+    await welcome_msg.send()
     
-    # Initialize vector store
-    vectorstore = initialize_vector_store()
-    if not vectorstore:
-        await cl.Message("Error: Could not initialize vector store.").send()
-        return
-    
-    # Load reference data
-    with cl.Step("Loading reference data"):
-        vectorstore = await load_reference_data(vectorstore)
-        cl.user_session.set("qdrant_vectorstore", vectorstore)
-        cl.user_session.set("qdrant_retriever", vectorstore.as_retriever())
-        await cl.Message("Reference data loaded successfully!").send()
-    
-    # Now wait for user to upload files
+    # Wait for file upload
     files = await cl.AskFileMessage(
-        content="I'm ready to help you analyze documents. Please upload two PDF files for comparison:",
+        content="Please upload a NIH HEAL protocol PDF file to analyze alongside the Excel data.",
         accept=["application/pdf"],
-        max_files=2,
-        timeout=3600  # Give users plenty of time to upload files
+        max_size_mb=20,
+        timeout=180,
     ).send()
     
-    if not files:
-        await cl.Message("No files were uploaded. You can send a message to continue.").send()
-        return
+    if files:
+        processing_msg = cl.Message(content="Processing your protocol PDF file...")
+        await processing_msg.send()
         
-    if len(files) != 2:
-        await cl.Message("Please upload exactly two PDF files for comparison.").send()
-        return
-    
-    # Process uploaded files
-    with cl.Step("Processing uploaded files"):
-        success = await process_uploaded_files(files, vectorstore)
-        if success:
-            # Update the retriever with the latest vector store
-            cl.user_session.set("qdrant_retriever", vectorstore.as_retriever())
-            await cl.Message("Files uploaded and processed successfully! You can now enter your query.").send()
+        # Process the uploaded files
+        user_vectorstore = await process_uploaded_files(files)
+        
+        if user_vectorstore:
+            analysis_msg = cl.Message(content="Analyzing your protocol to identify instruments for NIH HEAL CDE core domains...")
+            await analysis_msg.send()
+            
+            # Use the identify_heal_instruments tool to analyze the protocol
+            config = {"configurable": {"thread_id": cl.context.session.id}}
+            
+            # Create a message to trigger the analysis
+            analysis_request = HumanMessage(content="Please analyze the uploaded protocol and identify instruments for each NIH HEAL CDE core domain.")
+            
+            final_answer = cl.Message(content="")
+            
+            for msg, metadata in graph.stream(
+                {"messages": [analysis_request]}, 
+                stream_mode="messages", 
+                config=config
+            ):
+                if (
+                    msg.content
+                    and not isinstance(msg, HumanMessage)
+                    and metadata["langgraph_node"] == "final"
+                ):
+                    await final_answer.stream_token(msg.content)
+            
+            await final_answer.send()
+            
+            await cl.Message(content="You can now ask additional questions about the protocol or the Excel data.").send()
         else:
-            await cl.Message("Error: Unable to process files. Please try again.").send()
-
+            await cl.Message(content="There was an issue processing your PDF. Please try uploading again.").send()
+    else:
+        await cl.Message(content="No file was uploaded. You can still ask questions about the Excel data.").send()
 
 @cl.on_message
-async def handle_message(message: cl.Message):
-    # Get chat history
-    chat_history = cl.user_session.get("chat_history", [])
+async def on_message(msg: cl.Message):
+    config = {"configurable": {"thread_id": cl.context.session.id}}
     
-    # Run the agent
-    with cl.Step("Agent thinking"):
-        response = await cl.make_async(agent_executor.invoke)(
-            {"input": message.content, "chat_history": chat_history}
-        )
+    # Completely disable tracing
+    os.environ["LANGCHAIN_TRACING_V2"] = "false"
+    os.environ["LANGCHAIN_TRACING"] = "false"
     
-    # Handle the response based on the tool that was called
-    if isinstance(response["output"], dict) and "messages" in response["output"]:
-        # This is from document_query_tool
-        await cl.Message(response["output"]["messages"][0].content).send()
-    else:
-        # Generic response (including the confirmation from document_comparison_tool)
-        await cl.Message(content=str(response["output"])).send()
+    # For all messages, use the graph to handle the logic
+    final_answer = cl.Message(content="")
     
-    # Update chat history with the new exchange
-    chat_history.extend([
-        HumanMessage(content=message.content),
-        HumanMessage(content=str(response["output"]))
-    ])
-    cl.user_session.set("chat_history", chat_history)
+    # Check if files exist for instrument-related queries
+    if (any(keyword in msg.content.lower() for keyword in ["instrument", "measure", "assessment", "questionnaire", "scale", "protocol"]) and 
+        not any(f for f in os.listdir(UPLOAD_PATH) if f.endswith('.pdf'))):
+        await cl.Message(content="No protocol document has been detected. Please upload a protocol document first.").send()
+        return
     
+    # Let the graph handle all message processing
+    for msg_response, metadata in graph.stream(
+        {"messages": [HumanMessage(content=msg.content)]}, 
+        stream_mode="messages", 
+        config=config
+    ):
+        if (
+            msg_response.content
+            and not isinstance(msg_response, HumanMessage)
+            and metadata["langgraph_node"] == "final"
+        ):
+            await final_answer.stream_token(msg_response.content)
+
+    await final_answer.send()
