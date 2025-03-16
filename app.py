@@ -31,11 +31,15 @@ from langchain_core.output_parsers import StrOutputParser
 load_dotenv()
 
 # Constants
+UPLOAD_PATH = "./uploads"
 INITIAL_EMBEDDINGS_DIR = "./initial_embeddings"
 INITIAL_EMBEDDINGS_NAME = "initial_embeddings"
 XLSX_MODEL_ID = "Snowflake/snowflake-arctic-embed-m"
-UPLOAD_PATH = "./uploads"
+PDF_MODEL_ID = "Snowflake/snowflake-arctic-embed-m"
 USER_EMBEDDINGS_NAME = "user_embeddings"
+
+# Make sure upload directory exists
+os.makedirs(UPLOAD_PATH, exist_ok=True)
 
 # NIH HEAL CDE core domains
 NIH_HEAL_DOMAINS = [
@@ -53,9 +57,6 @@ NIH_HEAL_DOMAINS = [
 
 # Initialize Qdrant (in-memory)
 qdrant_client = QdrantClient(":memory:")
-
-# Make sure upload directory exists
-os.makedirs(UPLOAD_PATH, exist_ok=True)
 
 # Create a semantic splitter for PDF documents
 semantic_splitter = RecursiveCharacterTextSplitter(chunk_size=512, chunk_overlap=50)
@@ -118,9 +119,9 @@ def process_initial_embeddings():
 def format_docs(docs):
     return "\n\n".join(doc.page_content for doc in docs)
 
-async def process_uploaded_files(files, model_name=XLSX_MODEL_ID):
-    """Process uploaded PDF files and add them to a separate vector store collection"""
-    print(f"Processing {len(files)} uploaded files")
+async def load_and_chunk_pdf_files(files):
+    """Load PDF files and split them into chunks with metadata."""
+    print(f"Loading {len(files)} uploaded PDF files")
     documents_with_metadata = []
     
     for file in files:
@@ -148,46 +149,57 @@ async def process_uploaded_files(files, model_name=XLSX_MODEL_ID):
         except Exception as e:
             print(f"Error processing {file.name}: {str(e)}")
     
-    if documents_with_metadata:
-        # Create a new embeddings model
-        pdf_model = HuggingFaceEmbeddings(model_name=model_name)
+    return documents_with_metadata
+
+async def embed_pdf_chunks_in_qdrant(documents_with_metadata, model_name=PDF_MODEL_ID):
+    """Create a vector store and embed PDF chunks into Qdrant."""
+    if not documents_with_metadata:
+        print("No documents to embed")
+        return None
         
-        # Create a new vector store collection for user uploads
-        try:
-            # First, check if collection exists and delete it if it does
-            if USER_EMBEDDINGS_NAME in [c.name for c in qdrant_client.get_collections().collections]:
-                qdrant_client.delete_collection(USER_EMBEDDINGS_NAME)
-                
-            # Create the collection with proper parameters
-            # Get the embedding dimension by creating a sample embedding
-            sample_text = "Sample text to determine embedding dimension"
-            sample_embedding = pdf_model.embed_query(sample_text)
-            embedding_dimension = len(sample_embedding)
+    # Create a new embeddings model
+    pdf_model = HuggingFaceEmbeddings(model_name=model_name)
+    
+    try:
+        # First, check if collection exists and delete it if it does
+        if USER_EMBEDDINGS_NAME in [c.name for c in qdrant_client.get_collections().collections]:
+            qdrant_client.delete_collection(USER_EMBEDDINGS_NAME)
             
-            qdrant_client.create_collection(
-                collection_name=USER_EMBEDDINGS_NAME,
-                vectors_config=VectorParams(size=embedding_dimension, distance=Distance.COSINE)
-            )
-            
-            # Create the vector store
-            user_vectorstore = QdrantVectorStore(
-                client=qdrant_client,
-                collection_name=USER_EMBEDDINGS_NAME,
-                embedding=pdf_model
-            )
-            
-            # Add documents to the vector store
-            user_vectorstore.add_documents(documents_with_metadata)
-            
-            print(f"Added {len(documents_with_metadata)} chunks from uploaded files to collection '{USER_EMBEDDINGS_NAME}'")
-            return user_vectorstore
-        except Exception as e:
-            print(f"Error creating vector store: {str(e)}")
-            return None
-    return None
+        # Create the collection with proper parameters
+        # Get the embedding dimension by creating a sample embedding
+        sample_text = "Sample text to determine embedding dimension"
+        sample_embedding = pdf_model.embed_query(sample_text)
+        embedding_dimension = len(sample_embedding)
+        
+        qdrant_client.create_collection(
+            collection_name=USER_EMBEDDINGS_NAME,
+            vectors_config=VectorParams(size=embedding_dimension, distance=Distance.COSINE)
+        )
+        
+        # Create the vector store
+        user_vectorstore = QdrantVectorStore(
+            client=qdrant_client,
+            collection_name=USER_EMBEDDINGS_NAME,
+            embedding=pdf_model
+        )
+        
+        # Add documents to the vector store
+        user_vectorstore.add_documents(documents_with_metadata)
+        
+        print(f"Added {len(documents_with_metadata)} chunks from uploaded files to collection '{USER_EMBEDDINGS_NAME}'")
+        return user_vectorstore
+    except Exception as e:
+        print(f"Error creating vector store: {str(e)}")
+        return None
+
+async def process_uploaded_files(files, model_name=PDF_MODEL_ID):
+    """Process uploaded PDF files and add them to a separate vector store collection"""
+    documents_with_metadata = await load_and_chunk_pdf_files(files)
+    return await embed_pdf_chunks_in_qdrant(documents_with_metadata, model_name)
 
 # Data processing and initialization
 vectorstore = process_initial_embeddings()
+
 
 # Create a retriever from the vector store
 if vectorstore:
