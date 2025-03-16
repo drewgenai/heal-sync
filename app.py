@@ -61,12 +61,9 @@ os.makedirs(UPLOAD_PATH, exist_ok=True)
 semantic_splitter = RecursiveCharacterTextSplitter(chunk_size=512, chunk_overlap=50)
 
 # Utility functions
-def process_initial_embeddings():
-    """Loads all .xlsx files, extracts text, embeds, and stores in Qdrant."""
-
-    xlsx_model = HuggingFaceEmbeddings(model_name=XLSX_MODEL_ID)
+def load_and_chunk_excel_files():
+    """Loads all .xlsx files from the initial embeddings directory and splits them into chunks."""
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=512, chunk_overlap=50)
-
     all_chunks = []
     file_count = 0
     
@@ -94,21 +91,29 @@ def process_initial_embeddings():
                 print(f"Error processing {file}: {str(e)}")
     
     print(f"Processed {file_count} Excel files with a total of {len(all_chunks)} chunks.")
-    
-    # Create vector store with all documents at once
-    if not all_chunks:
+    return all_chunks
+
+def embed_chunks_in_qdrant(chunks):
+    """Embeds document chunks and stores them in Qdrant."""
+    if not chunks:
         print("No Excel files found to process or all files were empty.")
         return None
 
+    xlsx_model = HuggingFaceEmbeddings(model_name=XLSX_MODEL_ID)
     print("Creating vector store...")
     vector_store = QdrantVectorStore.from_documents(
-        documents=all_chunks,
+        documents=chunks,
         embedding=xlsx_model,
         location=":memory:",
         collection_name=INITIAL_EMBEDDINGS_NAME
     )
     print(f"Successfully loaded all .xlsx files into Qdrant collection '{INITIAL_EMBEDDINGS_NAME}'.")
     return vector_store
+
+def process_initial_embeddings():
+    """Loads all .xlsx files, extracts text, embeds, and stores in Qdrant."""
+    chunks = load_and_chunk_excel_files()
+    return embed_chunks_in_qdrant(chunks)
 
 def format_docs(docs):
     return "\n\n".join(doc.page_content for doc in docs)
