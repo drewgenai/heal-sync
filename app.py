@@ -29,6 +29,13 @@ from langchain_core.output_parsers import StrOutputParser
 
 # Load environment variables
 load_dotenv()
+#####langsmith
+import uuid
+os.environ["LANGCHAIN_PROJECT"] = f"HEAL-SYNC - {uuid.uuid4().hex[0:8]}"
+os.environ["LANGCHAIN_TRACING_V2"] = "true"
+print(os.environ["LANGCHAIN_PROJECT"])
+###########langsmith
+
 
 # ==================== CONSTANTS ====================
 # Paths and directories
@@ -689,10 +696,6 @@ async def on_chat_start():
     session_qdrant_client = create_session_qdrant_client()
     cl.user_session.set("session_qdrant_client", session_qdrant_client)
     
-    # No need to initialize core_vectorstore here anymore
-    # Just use the global one that was initialized at startup
-    
-    # Wait for file upload
     files = await cl.AskFileMessage(
         content="Please upload a single NIH HEAL Protocol PDF file for analysis.",
         accept=["application/pdf"],
@@ -738,19 +741,14 @@ async def on_chat_start():
             
             await final_answer.send()
             
-            await cl.Message(content="You can now ask additional questions about the protocol or the core reference data.").send()
+            await cl.Message(content="You can now ask questions about the protocol.").send()
         else:
             await cl.Message(content="There was an issue processing your PDF. Please try uploading again.").send()
-    else:
-        await cl.Message(content="No file was uploaded. You can still ask questions about the core reference data.").send()
 
 @cl.on_message
 async def on_message(msg: cl.Message):
     config = {"configurable": {"thread_id": cl.context.session.id}}
-    
-    # Completely disable tracing
-    os.environ["LANGCHAIN_TRACING_V2"] = "false"
-    os.environ["LANGCHAIN_TRACING"] = "false"
+
     
     # For all messages, use the graph to handle the logic
     final_answer = cl.Message(content="")
