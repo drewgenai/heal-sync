@@ -36,7 +36,7 @@ UPLOAD_PATH = "./uploads"
 INITIAL_EMBEDDINGS_DIR = "./initial_embeddings"
 INITIAL_EMBEDDINGS_NAME = "initial_embeddings"
 USER_EMBEDDINGS_NAME = "user_embeddings"
-VECTOR_STORE_COLLECTION = "documents"
+# VECTOR_STORE_COLLECTION = "documents"
 
 # Model IDs
 EMBEDDING_MODEL_ID = "pritamdeka/S-PubMedBert-MS-MARCO"
@@ -61,15 +61,13 @@ NIH_HEAL_CORE_DOMAINS = [
 # Make sure upload directory exists
 os.makedirs(UPLOAD_PATH, exist_ok=True)
 
-# ==================== EMBEDDING MODEL SETUP ====================
+# ==================== EMBEDDING MODEL SETUP to allow flexibility of model selection ====================
 def get_embedding_model(model_id):
     """Creates and returns the appropriate embedding model based on the model ID."""
     if "text-embedding" in model_id:
-        # OpenAI embeddings
         from langchain_openai import OpenAIEmbeddings
         return OpenAIEmbeddings(model=model_id)
     else:
-        # HuggingFace embeddings
         return HuggingFaceEmbeddings(model_name=model_id)
 
 def initialize_embedding_models():
@@ -84,16 +82,13 @@ def initialize_embedding_models():
 # Initialize the embedding model
 initialize_embedding_models()
 
-# Get embedding dimensions utility
-def get_embedding_dimensions(model_id):
-    """Gets the dimensions of embeddings from a specific model."""
-    model = get_embedding_model(model_id)
-    sample_text = "Sample text to determine embedding dimension"
-    sample_embedding = model.embed_query(sample_text)
-    return len(sample_embedding)
-
 # ==================== QDRANT SETUP ====================
-qdrant_client = QdrantClient(":memory:")
+# Create a global Qdrant client for the core embeddings (available to all sessions)
+global_qdrant_client = QdrantClient(":memory:")
+
+# Initialize a function to create session-specific Qdrant clients
+def create_session_qdrant_client():
+    return QdrantClient(":memory:")
 
 # ==================== DOCUMENT PROCESSING ====================
 # Create a semantic splitter for documents
@@ -138,8 +133,8 @@ def load_and_chunk_core_reference_files():
     return all_chunks
 
 def embed_core_reference_in_qdrant(chunks):
-    """Embeds core reference chunks and stores them in Qdrant."""
-    global embedding_model
+    """Embeds core reference chunks and stores them in the global Qdrant instance."""
+    global embedding_model, global_qdrant_client
     
     if not chunks:
         print("No Excel files found to process or all files were empty.")
@@ -151,15 +146,32 @@ def embed_core_reference_in_qdrant(chunks):
         initialize_embedding_models()
         
     print(f"Using embedding model: {EMBEDDING_MODEL_ID}")
-    print("Creating vector store...")
+    print("Creating vector store for core reference data...")
     
     try:
-        vector_store = QdrantVectorStore.from_documents(
-            documents=chunks,
-            embedding=embedding_model,
-            location=":memory:",
-            collection_name=INITIAL_EMBEDDINGS_NAME
+        # First, check if collection exists and delete it if it does
+        if INITIAL_EMBEDDINGS_NAME in [c.name for c in global_qdrant_client.get_collections().collections]:
+            global_qdrant_client.delete_collection(INITIAL_EMBEDDINGS_NAME)
+            
+        # Create the collection with proper parameters
+        # Get the embedding dimension from the model
+        embedding_dimension = len(embedding_model.embed_query("Sample text"))
+        
+        global_qdrant_client.create_collection(
+            collection_name=INITIAL_EMBEDDINGS_NAME,
+            vectors_config=VectorParams(size=embedding_dimension, distance=Distance.COSINE)
         )
+        
+        # Create the vector store
+        vector_store = QdrantVectorStore(
+            client=global_qdrant_client,
+            collection_name=INITIAL_EMBEDDINGS_NAME,
+            embedding=embedding_model
+        )
+        
+        # Add documents to the vector store
+        vector_store.add_documents(chunks)
+        
         print(f"Successfully loaded all .xlsx files into Qdrant collection '{INITIAL_EMBEDDINGS_NAME}'.")
         return vector_store
     except Exception as e:
@@ -167,10 +179,18 @@ def embed_core_reference_in_qdrant(chunks):
         print(f"Embedding model status: {embedding_model is not None}")
         return None
 
+# Initialize core embeddings on application startup
+core_vectorstore = None
+
 def initialize_core_reference_embeddings():
-    """Loads all .xlsx files, extracts text, embeds, and stores in Qdrant."""
+    """Loads all .xlsx files, extracts text, embeds, and stores in global Qdrant."""
+    global core_vectorstore
     chunks = load_and_chunk_core_reference_files()
-    return embed_core_reference_in_qdrant(chunks)
+    core_vectorstore = embed_core_reference_in_qdrant(chunks)
+    return core_vectorstore
+
+# Call this function when the application starts
+initialize_core_reference_embeddings()
 
 # ==================== PROTOCOL DOCUMENT PROCESSING ====================
 async def load_and_chunk_protocol_files(files):
@@ -182,10 +202,6 @@ async def load_and_chunk_protocol_files(files):
         print(f"Processing file: {file.name}, size: {file.size} bytes")
         file_path = os.path.join(UPLOAD_PATH, file.name)
         
-        # Ensure the upload directory exists
-        os.makedirs(UPLOAD_PATH, exist_ok=True)
-        
-        # Copy the file to the upload directory
         shutil.copyfile(file.path, file_path)
         
         try:
@@ -211,33 +227,29 @@ async def load_and_chunk_protocol_files(files):
     
     return documents_with_metadata
 
-async def embed_protocol_in_qdrant(documents_with_metadata, model_name=EMBEDDING_MODEL_ID):
-    """Create a vector store and embed protocol chunks into Qdrant."""
+async def embed_protocol_in_qdrant(documents_with_metadata, session_qdrant_client, model_name=EMBEDDING_MODEL_ID):
+    """Create a vector store and embed protocol chunks into session-specific Qdrant."""
     global embedding_model
-    
-    if not documents_with_metadata:
-        print("No documents to embed")
-        return None
-        
+      
     print(f"Using embedding model: {model_name}")
     
     try:
         # First, check if collection exists and delete it if it does
-        if USER_EMBEDDINGS_NAME in [c.name for c in qdrant_client.get_collections().collections]:
-            qdrant_client.delete_collection(USER_EMBEDDINGS_NAME)
+        if USER_EMBEDDINGS_NAME in [c.name for c in session_qdrant_client.get_collections().collections]:
+            session_qdrant_client.delete_collection(USER_EMBEDDINGS_NAME)
             
         # Create the collection with proper parameters
         # Get the embedding dimension from the model
         embedding_dimension = len(embedding_model.embed_query("Sample text"))
         
-        qdrant_client.create_collection(
+        session_qdrant_client.create_collection(
             collection_name=USER_EMBEDDINGS_NAME,
             vectors_config=VectorParams(size=embedding_dimension, distance=Distance.COSINE)
         )
         
         # Create the vector store
         user_vectorstore = QdrantVectorStore(
-            client=qdrant_client,
+            client=session_qdrant_client,
             collection_name=USER_EMBEDDINGS_NAME,
             embedding=embedding_model
         )
@@ -251,25 +263,40 @@ async def embed_protocol_in_qdrant(documents_with_metadata, model_name=EMBEDDING
         print(f"Error creating vector store: {str(e)}")
         return None
 
-async def process_uploaded_protocol(files, model_name=EMBEDDING_MODEL_ID):
-    """Process uploaded protocol PDF files and add them to a separate vector store collection"""
+async def process_uploaded_protocol(files, session_qdrant_client, model_name=EMBEDDING_MODEL_ID):
+    """Process uploaded protocol PDF files and add them to a session-specific vector store collection"""
     documents_with_metadata = await load_and_chunk_protocol_files(files)
-    return await embed_protocol_in_qdrant(documents_with_metadata, model_name)
+    return await embed_protocol_in_qdrant(documents_with_metadata, session_qdrant_client, model_name)
 
 # ==================== RETRIEVAL FUNCTIONS ====================
 def retrieve_documents(query, doc_type=None, k=5):
-    """Retrieve documents, optionally filtering by document type"""
+    """Retrieve documents from either core or session database based on doc_type"""
+    global embedding_model, global_qdrant_client
+    
+    # Get the appropriate client and collection name
+    if doc_type == "protocol":
+        # Use session-specific client for protocol documents
+        client = cl.user_session.get("session_qdrant_client")
+        collection_name = USER_EMBEDDINGS_NAME
+        if not client:
+            print("No session client available")
+            return []
+    else:
+        # Use global client for core reference documents
+        client = global_qdrant_client
+        collection_name = INITIAL_EMBEDDINGS_NAME
+    
+    # Create vector store with the appropriate client
     vector_store = QdrantVectorStore(
-        client=qdrant_client,
-        collection_name=VECTOR_STORE_COLLECTION,
+        client=client,
+        collection_name=collection_name,
         embedding=embedding_model
     )
     
-    # Set up filter if doc_type is specified
+    # Set up search parameters
     search_kwargs = {"k": k}
-    if doc_type:
-        search_kwargs["filter"] = {"type": doc_type}
-        
+    
+    # Create and use retriever
     retriever = vector_store.as_retriever(search_kwargs=search_kwargs)
     return retriever.invoke(query)
 
@@ -288,11 +315,12 @@ Context:
 """
 
 rag_prompt = ChatPromptTemplate.from_template(RAG_TEMPLATE)
-chat_model = ChatOpenAI()
+#chat_model = ChatOpenAI()
+chat_model = ChatOpenAI(model_name="gpt-4o")
 
 # Create a RAG chain that can be filtered by document type
 def create_rag_chain(doc_type=None):
-    """Create a RAG chain that can be filtered by document type"""
+    """Create a RAG chain that can be filtered by document type (protocol/core_reference)"""
     def retrieve_with_type(query):
         docs = retrieve_documents(query, doc_type=doc_type)
         return format_docs(docs)
@@ -337,21 +365,42 @@ def search_all_data(query: str, doc_type: str = None) -> str:
 @tool
 def search_core_reference(query: str, top_k: int = 3) -> str:
     """Search core reference data and protocol data for information related to the query."""
-    global embedding_model
+    global embedding_model, global_qdrant_client
     
-    # Use the existing core_reference_retrieval_chain
-    result = core_reference_retrieval_chain.invoke({"question": query})
+    # Create a retriever for the core embeddings
+    core_retriever = QdrantVectorStore(
+        client=global_qdrant_client,
+        collection_name=INITIAL_EMBEDDINGS_NAME,
+        embedding=embedding_model
+    ).as_retriever(search_kwargs={"k": top_k})
+    
+    # Create a retrieval chain for core documents
+    core_retrieval_chain = (
+        {"context": itemgetter("question") | core_retriever | format_docs, 
+         "question": itemgetter("question")}
+        | rag_prompt 
+        | chat_model
+        | StrOutputParser()
+    )
+    
+    # Get results from core reference
+    result = core_retrieval_chain.invoke({"question": query})
+    
+    # Get the session-specific Qdrant client
+    session_qdrant_client = cl.user_session.get("session_qdrant_client")
+    if not session_qdrant_client:
+        return result  # Return only core results if no session client
     
     # If we have a user collection, also search that
     try:
         # Check if user collection exists
-        if USER_EMBEDDINGS_NAME not in [c.name for c in qdrant_client.get_collections().collections]:
+        if USER_EMBEDDINGS_NAME not in [c.name for c in session_qdrant_client.get_collections().collections]:
             # If no user collection exists yet, just return core reference results
             return result
             
         # Create a retrieval chain for user documents
         user_retriever = QdrantVectorStore(
-            client=qdrant_client,
+            client=session_qdrant_client,
             collection_name=USER_EMBEDDINGS_NAME,
             embedding=embedding_model
         ).as_retriever(search_kwargs={"k": top_k})
@@ -376,76 +425,75 @@ def search_core_reference(query: str, top_k: int = 3) -> str:
 @tool
 def load_and_embed_protocol(file_path: str = None) -> str:
     """Load and embed a protocol PDF file into the vector store."""
-    """Load and embed a protocol PDF file into the vector store.
+    # Get the session-specific Qdrant client
+    session_qdrant_client = cl.user_session.get("session_qdrant_client")
+    if not session_qdrant_client:
+        return "No session-specific Qdrant client found. Please restart the chat."
     
-    Args:
-        file_path: Optional path to the PDF file. If None, will use files in the upload directory.
+    # If no specific file path is provided, use all PDFs in the upload directory
+    if not file_path:
+        uploaded_files = [f for f in os.listdir(UPLOAD_PATH) if f.endswith('.pdf')]
+        if not uploaded_files:
+            return "No protocol documents found in the upload directory."
         
-    Returns:
-        String indicating success or failure of the embedding process
-    """
-    try:
-        # If no specific file path is provided, use all PDFs in the upload directory
-        if not file_path:
-            uploaded_files = [f for f in os.listdir(UPLOAD_PATH) if f.endswith('.pdf')]
-            if not uploaded_files:
-                return "No protocol documents found in the upload directory."
-            
-            # Create file objects for processing
-            files = []
-            for filename in uploaded_files:
-                file_path = os.path.join(UPLOAD_PATH, filename)
-                # Create a simple object with the necessary attributes
-                class FileObj:
-                    def __init__(self, path, name, size):
-                        self.path = path
-                        self.name = name
-                        self.size = size
-                
-                file_size = os.path.getsize(file_path)
-                files.append(FileObj(file_path, filename, file_size))
-        else:
-            # Create a file object for the specific file
-            if not os.path.exists(file_path):
-                return f"File not found: {file_path}"
-            
-            filename = os.path.basename(file_path)
-            file_size = os.path.getsize(file_path)
-            
+        # Create file objects for processing
+        files = []
+        for filename in uploaded_files:
+            file_path = os.path.join(UPLOAD_PATH, filename)
+            # Create a simple object with the necessary attributes
             class FileObj:
                 def __init__(self, path, name, size):
                     self.path = path
                     self.name = name
                     self.size = size
             
-            files = [FileObj(file_path, filename, file_size)]
+            file_size = os.path.getsize(file_path)
+            files.append(FileObj(file_path, filename, file_size))
+    else:
+        # Create a file object for the specific file
+        if not os.path.exists(file_path):
+            return f"File not found: {file_path}"
         
-        # Process the files asynchronously
-        import asyncio
-        documents_with_metadata = asyncio.run(load_and_chunk_protocol_files(files))
-        user_vectorstore = asyncio.run(embed_protocol_in_qdrant(documents_with_metadata, EMBEDDING_MODEL_ID))
+        filename = os.path.basename(file_path)
+        file_size = os.path.getsize(file_path)
         
-        if user_vectorstore:
-            return f"Successfully embedded {len(documents_with_metadata)} chunks from {len(files)} protocol document(s)."
-        else:
-            return "Failed to embed protocol document(s)."
-    except Exception as e:
-        return f"Error embedding protocol document: {str(e)}"
+        class FileObj:
+            def __init__(self, path, name, size):
+                self.path = path
+                self.name = name
+                self.size = size
+        
+        files = [FileObj(file_path, filename, file_size)]
+    
+    # Process the files asynchronously
+    import asyncio
+    documents_with_metadata = asyncio.run(load_and_chunk_protocol_files(files))
+    user_vectorstore = asyncio.run(embed_protocol_in_qdrant(documents_with_metadata, session_qdrant_client, EMBEDDING_MODEL_ID))
+    
+    if user_vectorstore:
+        return f"Successfully embedded {len(documents_with_metadata)} chunks from {len(files)} protocol document(s)."
+    else:
+        return "Failed to embed protocol document(s)."
 
 @tool
 def search_protocol_for_instruments(domain: str) -> dict:
     """Search the protocol for instruments related to a specific NIH HEAL CDE core domain."""
     global embedding_model
     
+    # Get the session-specific Qdrant client
+    session_qdrant_client = cl.user_session.get("session_qdrant_client")
+    if not session_qdrant_client:
+        return {"domain": domain, "instrument": "No session-specific Qdrant client found", "context": ""}
+    
     # Check if user collection exists
     try:
         # Check if collection exists
-        if USER_EMBEDDINGS_NAME not in [c.name for c in qdrant_client.get_collections().collections]:
+        if USER_EMBEDDINGS_NAME not in [c.name for c in session_qdrant_client.get_collections().collections]:
             return {"domain": domain, "instrument": "No protocol document embedded", "context": ""}
             
         # Create retriever for user documents
         user_retriever = QdrantVectorStore(
-            client=qdrant_client,
+            client=session_qdrant_client,
             collection_name=USER_EMBEDDINGS_NAME,
             embedding=embedding_model
         ).as_retriever(search_kwargs={"k": 10})
@@ -611,7 +659,8 @@ def call_final_model(state: MessagesState):
     last_ai_message = messages[-1]
     response = final_model.invoke(
         [
-            SystemMessage("Rewrite this in the voice of a helpful and kind assistant"),
+            #SystemMessage("Rewrite this in the voice of a helpful and kind assistant"),
+            SystemMessage("do not alter just present the information"),
             HumanMessage(last_ai_message.content),
         ]
     )
@@ -640,6 +689,16 @@ graph = builder.compile()
 # ==================== CHAINLIT HANDLERS ====================
 @cl.on_chat_start
 async def on_chat_start():
+    # Create a session-specific Qdrant client
+    session_qdrant_client = create_session_qdrant_client()
+    cl.user_session.set("session_qdrant_client", session_qdrant_client)
+    
+    # Create a retriever for the core embeddings
+    global core_vectorstore
+    if core_vectorstore:
+        core_retriever = core_vectorstore.as_retriever()
+        cl.user_session.set("core_retriever", core_retriever)
+    
     # Welcome message
     welcome_msg = cl.Message(content="Welcome! Please upload a NIH HEAL protocol PDF file to get started.")
     await welcome_msg.send()
@@ -656,9 +715,9 @@ async def on_chat_start():
         processing_msg = cl.Message(content="Processing your protocol PDF file...")
         await processing_msg.send()
         
-        # Process the uploaded files
+        # Process the uploaded files with the session-specific client
         documents_with_metadata = await load_and_chunk_protocol_files(files)
-        user_vectorstore = await embed_protocol_in_qdrant(documents_with_metadata)
+        user_vectorstore = await embed_protocol_in_qdrant(documents_with_metadata, session_qdrant_client)
         
         if user_vectorstore:
             analysis_msg = cl.Message(content="Analyzing your protocol to identify instruments (CRF questionaires) for NIH HEAL CDE core domains...")
