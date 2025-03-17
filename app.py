@@ -433,35 +433,6 @@ def load_and_embed_protocol_pdf(file_path: str = None) -> str:
     except Exception as e:
         return f"Error embedding protocol document: {str(e)}"
 
-@tool
-def search_protocol(query: str, top_k: int = 5) -> str:
-    """Search the protocol for information related to the query."""
-    global embedding_model
-    
-    try:
-        # Check if user collection exists
-        if USER_EMBEDDINGS_NAME not in [c.name for c in qdrant_client.get_collections().collections]:
-            return "No protocol document has been embedded yet. Please upload and embed a protocol first."
-        
-        # Create a retrieval chain for user documents
-        user_retriever = QdrantVectorStore(
-            client=qdrant_client,
-            collection_name=USER_EMBEDDINGS_NAME,
-            embedding=embedding_model
-        ).as_retriever(search_kwargs={"k": top_k})
-        
-        user_retrieval_chain = (
-            {"context": itemgetter("question") | user_retriever | format_docs, 
-             "question": itemgetter("question")}
-            | rag_prompt 
-            | chat_model
-            | StrOutputParser()
-        )
-        
-        result = user_retrieval_chain.invoke({"question": query})
-        return result
-    except Exception as e:
-        return f"Error searching protocol: {str(e)}"
 
 @tool
 def search_protocol_for_instruments(domain: str) -> dict:
@@ -525,43 +496,7 @@ def search_protocol_for_instruments(domain: str) -> dict:
         print(f"Error identifying instrument for {domain}: {str(e)}")
         return {"domain": domain, "instrument": "Error during identification", "context": str(e)}
 
-@tool
-def analyze_domain(domain: str) -> dict:
-    """Analyze a specific NIH HEAL CDE core domain"""
-    # Query for this specific domain
-    query = f"What instrument or measure is used for {domain} in the protocol?"
-    
-    # Get protocol context
-    protocol_docs = retrieve_documents(query, doc_type="pdf", k=5)
-    protocol_context = format_docs(protocol_docs)
-    
-    # Get known instruments from Excel data
-    excel_query = f"What are standard instruments or measures for {domain}?"
-    excel_docs = retrieve_documents(excel_query, doc_type="excel", k=5)
-    excel_context = format_docs(excel_docs)
-    
-    # Use the model to identify the instrument
-    prompt = f"""
-    Based on the protocol information and known instruments, identify which instrument is being used for the domain: {domain}
-    
-    Protocol information:
-    {protocol_context}
-    
-    Known instruments for this domain:
-    {excel_context}
-    
-    Respond with only the name of the identified instrument. If you cannot identify a specific instrument, respond with "Not identified".
-    """
-    
-    instrument = ChatOpenAI(model_name=INSTRUMENT_SEARCH_LLM, temperature=0).invoke(
-        [HumanMessage(content=prompt)]
-    ).content
-    
-    return {
-        "domain": domain,
-        "instrument": instrument.strip(),
-        "context": protocol_context
-    }
+
 
 @tool
 def analyze_all_heal_domains() -> str:
@@ -594,24 +529,6 @@ def analyze_all_heal_domains() -> str:
     
     return result
 
-@tool
-def analyze_all_domains() -> str:
-    """Analyze all NIH HEAL CDE core domains at once"""
-    results = []
-    
-    for domain in NIH_HEAL_CORE_DOMAINS:
-        result = analyze_domain(domain)
-        results.append(result)
-    
-    # Format as markdown table
-    markdown = "# NIH HEAL CDE Core Domains Analysis\n\n"
-    markdown += "| Domain | Protocol Instrument |\n"
-    markdown += "|--------|--------------------|\n"
-    
-    for result in results:
-        markdown += f"| {result['domain']} | {result['instrument']} |\n"
-    
-    return markdown
 
 @tool
 def format_instrument_analysis(analysis_results: list, title: str = "NIH HEAL CDE Core Domains Analysis") -> str:
@@ -641,11 +558,8 @@ tools = [
     search_data,
     search_excel_data,
     load_and_embed_protocol_pdf,
-    search_protocol, 
     search_protocol_for_instruments, 
-    analyze_domain,
     analyze_all_heal_domains,
-    analyze_all_domains,
     format_instrument_analysis
 ]
 
@@ -811,5 +725,3 @@ async def on_message(msg: cl.Message):
             await final_answer.stream_token(msg_response.content)
 
     await final_answer.send()
-
-
