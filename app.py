@@ -93,7 +93,6 @@ def get_embedding_dimensions(model_id):
     return len(sample_embedding)
 
 # ==================== QDRANT SETUP ====================
-# Initialize Qdrant (in-memory)
 qdrant_client = QdrantClient(":memory:")
 
 # ==================== DOCUMENT PROCESSING ====================
@@ -496,7 +495,7 @@ def search_protocol_for_instruments(domain: str) -> dict:
         return {"domain": domain, "instrument": "Error during identification", "context": str(e)}
 
 @tool
-def analyze_protocol_domains() -> str:
+def analyze_protocol_domains() -> list:
     """Analyze all NIH HEAL CDE core domains and identify instruments used in the protocol."""
     # Check if protocol document exists
     uploaded_files = [f for f in os.listdir(UPLOAD_PATH) if f.endswith('.pdf')]
@@ -504,23 +503,21 @@ def analyze_protocol_domains() -> str:
         return "No protocol document has been uploaded yet."
     
     # For each domain, search for relevant instruments
-    domain_instruments = {}
+    domain_analysis_results = []
     
     for domain in NIH_HEAL_CORE_DOMAINS:
         # Use the search_protocol_for_instruments tool to get results for each domain
         result = search_protocol_for_instruments(domain)
-        domain_instruments[domain] = result["instrument"]
         print(f"Identified instrument for {domain}: {result['instrument']}")
+        
+        # Add the result to our list of analysis results
+        domain_analysis_results.append({
+            "domain": domain,
+            "instrument": result["instrument"]
+        })
     
-    # Format the results as a markdown table
-    result = "# NIH HEAL CDE Core Domains and Identified Instruments\n\n"
-    result += "| Domain | Protocol Instrument |\n"
-    result += "|--------|--------------------|\n"
-    
-    for domain, instrument in domain_instruments.items():
-        result += f"| {domain} | {instrument} |\n"
-    
-    return result
+    # Return the raw analysis results instead of formatting them
+    return domain_analysis_results
 
 @tool
 def format_domain_analysis(analysis_results: list, title: str = "NIH HEAL CDE Core Domains Analysis") -> str:
@@ -531,14 +528,15 @@ def format_domain_analysis(analysis_results: list, title: str = "NIH HEAL CDE Co
         
     Returns:
         Markdown formatted table of domains and identified instruments
-
-    
     """
-  
+    # Get the name of the uploaded protocol file
+    uploaded_files = [f for f in os.listdir(UPLOAD_PATH) if f.endswith('.pdf')]
+    protocol_name = uploaded_files[0] if uploaded_files else "Unknown Protocol"
+    
     # Format the results as a markdown table
     result = f"# {title}\n\n"
-    result += "| Domain | Protocol Instrument |\n"
-    result += "|--------|--------------------|\n"
+    result += f"| Domain | Protocol Instrument - {protocol_name} |\n"
+    result += "|--------|" + "-" * (len(protocol_name) + 23) + "|\n"
     
     for item in analysis_results:
         domain = item.get("domain", "Unknown")
