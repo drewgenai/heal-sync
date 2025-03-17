@@ -37,11 +37,13 @@ INITIAL_EMBEDDINGS_NAME = "initial_embeddings"
 USER_EMBEDDINGS_NAME = "user_embeddings"
 
 #XLSX_MODEL_ID = "Snowflake/snowflake-arctic-embed-m"
-#XLSX_MODEL_ID = "text-embedding-3-small"
 XLSX_MODEL_ID = "pritamdeka/S-PubMedBert-MS-MARCO"
 #PDF_MODEL_ID = "Snowflake/snowflake-arctic-embed-m"
-#PDF_MODEL_ID = "text-embedding-3-small"
 PDF_MODEL_ID = "pritamdeka/S-PubMedBert-MS-MARCO"
+
+INSTRUMENT_SEARCH_LLM = "gpt-4o"  # LLM for searching instruments
+INSTRUMENT_ANALYSIS_LLM = "gpt-4o"  # LLM for analyzing all domains
+
 
 
 # Make sure upload directory exists
@@ -299,15 +301,17 @@ def search_excel_data(query: str, top_k: int = 3) -> str:
     
     # If we have a user collection, also search that
     try:
-        # Use the same model that was used to create the collection
-        user_vectorstore = QdrantVectorStore(
+        # Check if user collection exists
+        if USER_EMBEDDINGS_NAME not in [c.name for c in qdrant_client.get_collections().collections]:
+            # If no user collection exists yet, just return Excel results
+            return result
+            
+        # Create a retrieval chain for user documents
+        user_retriever = QdrantVectorStore(
             client=qdrant_client,
             collection_name=USER_EMBEDDINGS_NAME,
-            embedding=get_embedding_model(PDF_MODEL_ID)  # Use PDF_MODEL_ID here
-        )
-        
-        # Create a retrieval chain for user documents
-        user_retriever = user_vectorstore.as_retriever(search_kwargs={"k": top_k})
+            embedding=get_embedding_model(PDF_MODEL_ID)  # Still need embedding model for retrieval
+        ).as_retriever(search_kwargs={"k": top_k})
         
         user_retrieval_chain = (
             {"context": itemgetter("question") | user_retriever | format_docs, 
@@ -323,72 +327,190 @@ def search_excel_data(query: str, top_k: int = 3) -> str:
         return f"From Excel files:\n{result}\n\nFrom your uploaded PDF:\n{user_result}"
     except Exception as e:
         print(f"Error searching user vector store: {str(e)}")
-        # If no user collection exists yet, just return Excel results
+        # If error occurs, just return Excel results
         return result
 
 @tool
-def identify_heal_instruments(protocol_text: str = "") -> str:
-    """Identify instruments (CRF questionaires) used in the protocol for each NIH HEAL CDE core domain.
+def load_and_embed_protocol_pdf(file_path: str = None) -> str:
+    """Load and embed a protocol PDF file into the vector store.
     
     Args:
-        protocol_text: Optional text from the protocol to analyze
+        file_path: Optional path to the PDF file. If None, will use files in the upload directory.
         
     Returns:
-        String containing identified instruments for each domain
+        String indicating success or failure of the embedding process
+    """
+    try:
+        # If no specific file path is provided, use all PDFs in the upload directory
+        if not file_path:
+            uploaded_files = [f for f in os.listdir(UPLOAD_PATH) if f.endswith('.pdf')]
+            if not uploaded_files:
+                return "No protocol documents found in the upload directory."
+            
+            # Create file objects for processing
+            files = []
+            for filename in uploaded_files:
+                file_path = os.path.join(UPLOAD_PATH, filename)
+                # Create a simple object with the necessary attributes
+                class FileObj:
+                    def __init__(self, path, name, size):
+                        self.path = path
+                        self.name = name
+                        self.size = size
+                
+                file_size = os.path.getsize(file_path)
+                files.append(FileObj(file_path, filename, file_size))
+        else:
+            # Create a file object for the specific file
+            if not os.path.exists(file_path):
+                return f"File not found: {file_path}"
+            
+            filename = os.path.basename(file_path)
+            file_size = os.path.getsize(file_path)
+            
+            class FileObj:
+                def __init__(self, path, name, size):
+                    self.path = path
+                    self.name = name
+                    self.size = size
+            
+            files = [FileObj(file_path, filename, file_size)]
+        
+        # Process the files asynchronously
+        import asyncio
+        documents_with_metadata = asyncio.run(load_and_chunk_pdf_files(files))
+        user_vectorstore = asyncio.run(embed_pdf_chunks_in_qdrant(documents_with_metadata, PDF_MODEL_ID))
+        
+        if user_vectorstore:
+            return f"Successfully embedded {len(documents_with_metadata)} chunks from {len(files)} protocol document(s)."
+        else:
+            return "Failed to embed protocol document(s)."
+    except Exception as e:
+        return f"Error embedding protocol document: {str(e)}"
+
+@tool
+def search_protocol(query: str, top_k: int = 5) -> str:
+    """Search the protocol for information related to the query.
+    
+    Args:
+        query: The search query
+        top_k: Number of results to return (default: 5)
+        
+    Returns:
+        String containing the search results with their content and source files
+    """
+    try:
+        # Check if user collection exists
+        if USER_EMBEDDINGS_NAME not in [c.name for c in qdrant_client.get_collections().collections]:
+            return "No protocol document has been embedded yet. Please upload and embed a protocol first."
+        
+        # Create a retrieval chain for user documents
+        user_retriever = QdrantVectorStore(
+            client=qdrant_client,
+            collection_name=USER_EMBEDDINGS_NAME,
+            embedding=get_embedding_model(PDF_MODEL_ID)  # Still need embedding model for retrieval
+        ).as_retriever(search_kwargs={"k": top_k})
+        
+        user_retrieval_chain = (
+            {"context": itemgetter("question") | user_retriever | format_docs, 
+             "question": itemgetter("question")}
+            | rag_prompt 
+            | chat_model
+            | StrOutputParser()
+        )
+        
+        result = user_retrieval_chain.invoke({"question": query})
+        return result
+    except Exception as e:
+        return f"Error searching protocol: {str(e)}"
+
+@tool
+def search_protocol_for_instruments(domain: str) -> dict:
+    """Search the protocol for instruments related to a specific NIH HEAL CDE core domain.
+    
+    Args:
+        domain: The NIH HEAL CDE core domain to search for
+        
+    Returns:
+        Dictionary containing the domain, identified instrument, and supporting context
     """
     # Check if user collection exists
     try:
-        # Check if files exist in the upload directory
-        uploaded_files = [f for f in os.listdir(UPLOAD_PATH) if f.endswith('.pdf')]
-        
-        if not uploaded_files:
-            return "No protocol document has been uploaded yet."
+        # Check if collection exists
+        if USER_EMBEDDINGS_NAME not in [c.name for c in qdrant_client.get_collections().collections]:
+            return {"domain": domain, "instrument": "No protocol document embedded", "context": ""}
             
-        user_vectorstore = QdrantVectorStore(
+        # Create retriever for user documents
+        user_retriever = QdrantVectorStore(
             client=qdrant_client,
             collection_name=USER_EMBEDDINGS_NAME,
-            embedding=get_embedding_model(PDF_MODEL_ID)  # Use PDF_MODEL_ID here
-        )
-        user_retriever = user_vectorstore.as_retriever(search_kwargs={"k": 10})
+            embedding=get_embedding_model(PDF_MODEL_ID)  # Still need embedding model for retrieval
+        ).as_retriever(search_kwargs={"k": 10})
     except Exception as e:
         print(f"Error accessing user vector store: {str(e)}")
-        return "No protocol document has been uploaded yet or there was an error accessing it."
+        return {"domain": domain, "instrument": "Error accessing protocol", "context": str(e)}
+    
+    # Create the chat model with the specified model from constants
+    domain_chat_model = ChatOpenAI(model_name=INSTRUMENT_SEARCH_LLM, temperature=0)
+    
+    # Search for instruments related to this domain in the protocol
+    query = f"What instrument or measure is used for {domain} in the protocol?"
+    
+    try:
+        # Retrieve relevant chunks from the protocol
+        docs = user_retriever.invoke(query)
+        protocol_context = format_docs(docs)
+        
+        # Search for instruments in the Excel data that match this domain
+        excel_query = f"What are standard instruments or measures for {domain}?"
+        excel_instruments = initialembeddings_retrieval_chain.invoke({"question": excel_query})
+        
+        # Use the model to identify the most likely instrument for this domain
+        prompt = f"""
+        Based on the protocol information and known instruments, identify which instrument is being used for the domain: {domain}
+        
+        Protocol information:
+        {protocol_context}
+        
+        Known instruments for this domain:
+        {excel_instruments}
+        
+        Respond with only the name of the identified instrument. If you cannot identify a specific instrument, respond with "Not identified".
+        """
+        
+        instrument = domain_chat_model.invoke([HumanMessage(content=prompt)]).content
+        
+        # Return the results as a dictionary
+        return {
+            "domain": domain,
+            "instrument": instrument.strip(),
+            "context": protocol_context,
+            "known_instruments": excel_instruments
+        }
+    except Exception as e:
+        print(f"Error identifying instrument for {domain}: {str(e)}")
+        return {"domain": domain, "instrument": "Error during identification", "context": str(e)}
+
+@tool
+def analyze_all_heal_domains() -> str:
+    """Analyze all NIH HEAL CDE core domains and identify instruments used in the protocol.
+    
+    Returns:
+        Markdown formatted table of domains and identified instruments
+    """
+    # Check if protocol document exists
+    uploaded_files = [f for f in os.listdir(UPLOAD_PATH) if f.endswith('.pdf')]
+    if not uploaded_files:
+        return "No protocol document has been uploaded yet."
     
     # For each domain, search for relevant instruments
     domain_instruments = {}
     
     for domain in NIH_HEAL_CORE_DOMAINS:
-        # Search for instruments related to this domain in the protocol
-        query = f"What instrument or measure is used for {domain} in the protocol?"
-        
-        # Retrieve relevant chunks from the protocol
-        try:
-            docs = user_retriever.invoke(query)
-            protocol_context = format_docs(docs)
-            
-            # Search for instruments in the Excel data that match this domain
-            excel_query = f"What are standard instruments or measures for {domain}?"
-            excel_instruments = initialembeddings_retrieval_chain.invoke({"question": excel_query})
-            
-            # Use the model to identify the most likely instrument for this domain
-            prompt = f"""
-            Based on the protocol information and known instruments, identify which instrument is being used for the domain: {domain}
-            
-            Protocol information:
-            {protocol_context}
-            
-            Known instruments for this domain:
-            {excel_instruments}
-            
-            Respond with only the name of the identified instrument. If you cannot identify a specific instrument, respond with "Not identified".
-            """
-            
-            instrument = chat_model.invoke([HumanMessage(content=prompt)]).content
-            domain_instruments[domain] = instrument.strip()
-            print(f"Identified instrument for {domain}: {instrument.strip()}")
-        except Exception as e:
-            print(f"Error identifying instrument for {domain}: {str(e)}")
-            domain_instruments[domain] = "Error during identification"
+        # Use the search_protocol_for_instruments tool to get results for each domain
+        result = search_protocol_for_instruments(domain)
+        domain_instruments[domain] = result["instrument"]
+        print(f"Identified instrument for {domain}: {result['instrument']}")
     
     # Format the results as a markdown table
     result = "# NIH HEAL CDE Core Domains and Identified Instruments\n\n"
@@ -400,23 +522,61 @@ def identify_heal_instruments(protocol_text: str = "") -> str:
     
     return result
 
-tools = [search_excel_data, identify_heal_instruments]
+@tool
+def format_instrument_analysis(analysis_results: list, title: str = "NIH HEAL CDE Core Domains Analysis") -> str:
+    """Format instrument analysis results into a markdown table.
+    
+    Args:
+        analysis_results: List of dictionaries with domain and instrument information
+        title: Title for the markdown output
+        
+    Returns:
+        Markdown formatted table of domains and identified instruments
+    """
+    # Format the results as a markdown table
+    result = f"# {title}\n\n"
+    result += "| Domain | Protocol Instrument |\n"
+    result += "|--------|--------------------|\n"
+    
+    for item in analysis_results:
+        domain = item.get("domain", "Unknown")
+        instrument = item.get("instrument", "Not identified")
+        result += f"| {domain} | {instrument} |\n"
+    
+    return result
+
+# Update the tools list
+tools = [
+    search_excel_data,
+    load_and_embed_protocol_pdf,
+    search_protocol, 
+    search_protocol_for_instruments, 
+    analyze_all_heal_domains,
+    format_instrument_analysis
+]
 
 # LangGraph components
-model = ChatOpenAI(model_name="gpt-4o-mini", temperature=0)
-final_model = ChatOpenAI(model_name="gpt-4o-mini", temperature=0)
+model = ChatOpenAI(model_name=INSTRUMENT_ANALYSIS_LLM, temperature=0)
+final_model = ChatOpenAI(model_name=INSTRUMENT_ANALYSIS_LLM, temperature=0)
 
-# System message for the model
+# Update the system message
 system_message = """You are a helpful assistant specializing in NIH HEAL CDE protocols.
 
 You have access to:
 1. Excel data through the search_excel_data tool
-2. A tool to identify instruments (CRF questionaires) in NIH HEAL protocols (identify_heal_instruments)
+2. A tool to load and embed protocol PDFs (load_and_embed_protocol_pdf)
+3. A tool to search protocol documents for general information (search_protocol)
+4. A tool to search for instruments in protocols for specific domains (search_protocol_for_instruments)
+5. A tool to analyze all NIH HEAL domains at once (analyze_all_heal_domains)
+6. A tool to format analysis results into a markdown table (format_instrument_analysis)
 
 WHEN TO USE TOOLS:
-- When users ask about instruments, measures, assessments, questionnaires, or scales in a protocol, use the identify_heal_instruments tool.
+- When users upload a protocol PDF, use the load_and_embed_protocol_pdf tool.
+- When users ask general questions about the protocol, use the search_protocol tool.
+- When users ask about a specific instrument for a domain, use the search_protocol_for_instruments tool.
+- When users want a complete analysis of all domains, use the analyze_all_heal_domains tool.
 - When users ask about data or information in the Excel files, use the search_excel_data tool.
-- For general questions about NIH HEAL CDE domains, use the search_excel_data tool.
+- When you have multiple analysis results to present, use format_instrument_analysis to create a nice table.
 
 Be specific in your tool queries to get the most relevant information.
 Always use the appropriate tool before responding to questions about the protocol or Excel data.
@@ -496,17 +656,18 @@ async def on_chat_start():
         await processing_msg.send()
         
         # Process the uploaded files
-        user_vectorstore = await process_uploaded_files(files)
+        documents_with_metadata = await load_and_chunk_pdf_files(files)
+        user_vectorstore = await embed_pdf_chunks_in_qdrant(documents_with_metadata)
         
         if user_vectorstore:
             analysis_msg = cl.Message(content="Analyzing your protocol to identify instruments (CRF questionaires) for NIH HEAL CDE core domains...")
             await analysis_msg.send()
             
-            # Use the identify_heal_instruments tool to analyze the protocol
+            # Use the analyze_all_heal_domains tool to analyze the protocol
             config = {"configurable": {"thread_id": cl.context.session.id}}
             
             # Create a message to trigger the analysis
-            analysis_request = HumanMessage(content="Please analyze the uploaded protocol and identify instruments (CRF questionaires) for each NIH HEAL CDE core domain.")
+            analysis_request = HumanMessage(content="Please analyze the uploaded protocol and identify instruments for each NIH HEAL CDE core domain.")
             
             final_answer = cl.Message(content="")
             
@@ -540,12 +701,6 @@ async def on_message(msg: cl.Message):
     
     # For all messages, use the graph to handle the logic
     final_answer = cl.Message(content="")
-    
-    # Check if files exist for instrument-related queries
-    if (any(keyword in msg.content.lower() for keyword in ["instrument", "measure", "assessment", "questionnaire", "scale", "protocol"]) and 
-        not any(f for f in os.listdir(UPLOAD_PATH) if f.endswith('.pdf'))):
-        await cl.Message(content="No protocol document has been detected. Please upload a protocol document first.").send()
-        return
     
     # Let the graph handle all message processing
     for msg_response, metadata in graph.stream(
