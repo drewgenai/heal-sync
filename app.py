@@ -179,18 +179,54 @@ def embed_core_reference_in_qdrant(chunks):
         print(f"Embedding model status: {embedding_model is not None}")
         return None
 
+# ==================== RAG SETUP ====================
+# RAG template for all retrievals
+RAG_TEMPLATE = """\
+You are a helpful and kind assistant. Use the context provided below to answer the question.
+
+If you do not know the answer, or are unsure, say you don't know.
+
+Query:
+{question}
+
+Context:
+{context}
+"""
+
+rag_prompt = ChatPromptTemplate.from_template(RAG_TEMPLATE)
+chat_model = ChatOpenAI(model_name="gpt-4o")
+
 # Initialize core embeddings on application startup
 core_vectorstore = None
+core_retriever = None  # Global core retriever
 
 def initialize_core_reference_embeddings():
     """Loads all .xlsx files, extracts text, embeds, and stores in global Qdrant."""
-    global core_vectorstore
+    global core_vectorstore, core_retriever
     chunks = load_and_chunk_core_reference_files()
     core_vectorstore = embed_core_reference_in_qdrant(chunks)
+    
+    # Create the core retriever if vector store was created successfully
+    if core_vectorstore:
+        core_retriever = core_vectorstore.as_retriever(search_kwargs={"k": 10})
+        print("Core reference retriever created successfully.")
+    else:
+        print("Failed to create core reference retriever: No vector store available.")
+        
     return core_vectorstore
 
 # Call this function when the application starts
-initialize_core_reference_embeddings()
+core_vectorstore = initialize_core_reference_embeddings()
+
+# Chain for retrieving from core reference embeddings
+if core_retriever:
+    core_reference_retrieval_chain = (
+        {"context": itemgetter("question") | core_retriever | format_docs, 
+         "question": itemgetter("question")}
+        | rag_prompt 
+        | chat_model
+        | StrOutputParser()
+    )
 
 # ==================== PROTOCOL DOCUMENT PROCESSING ====================
 async def load_and_chunk_protocol_files(files):
@@ -269,88 +305,48 @@ async def process_uploaded_protocol(files, session_qdrant_client, model_name=EMB
     return await embed_protocol_in_qdrant(documents_with_metadata, session_qdrant_client, model_name)
 
 # ==================== RETRIEVAL FUNCTIONS ====================
-def retrieve_documents(query, doc_type=None, k=5):
-    """Retrieve documents from either core or session database based on doc_type"""
-    global embedding_model, global_qdrant_client
+def retrieve_from_core(query, k=5):
+    """Retrieve documents from core reference database"""
+    global core_retriever
     
-    # Get the appropriate client and collection name
-    if doc_type == "protocol":
-        # Use session-specific client for protocol documents
-        client = cl.user_session.get("session_qdrant_client")
-        collection_name = USER_EMBEDDINGS_NAME
-        if not client:
-            print("No session client available")
+    if not core_retriever:
+        print("No core retriever available")
+        return []
+    
+    # Override k if needed
+    if k != 10:  # Assuming default k=10 was used when creating the retriever
+        retriever = core_vectorstore.as_retriever(search_kwargs={"k": k})
+        return retriever.invoke(query)
+    
+    return core_retriever.invoke(query)
+
+def retrieve_from_protocol(query, k=5):
+    """Retrieve documents from protocol database"""
+    # Get the session-specific client
+    session_qdrant_client = cl.user_session.get("session_qdrant_client")
+    if not session_qdrant_client:
+        print("No session client available")
+        return []
+    
+    # Check if collection exists
+    try:
+        if USER_EMBEDDINGS_NAME not in [c.name for c in session_qdrant_client.get_collections().collections]:
+            print("No protocol document embedded")
             return []
-    else:
-        # Use global client for core reference documents
-        client = global_qdrant_client
-        collection_name = INITIAL_EMBEDDINGS_NAME
+    except Exception as e:
+        print(f"Error checking collections: {str(e)}")
+        return []
     
-    # Create vector store with the appropriate client
-    vector_store = QdrantVectorStore(
-        client=client,
-        collection_name=collection_name,
+    # Create vector store with the session client
+    protocol_vectorstore = QdrantVectorStore(
+        client=session_qdrant_client,
+        collection_name=USER_EMBEDDINGS_NAME,
         embedding=embedding_model
     )
     
-    # Set up search parameters
-    search_kwargs = {"k": k}
-    
     # Create and use retriever
-    retriever = vector_store.as_retriever(search_kwargs=search_kwargs)
-    return retriever.invoke(query)
-
-# ==================== RAG SETUP ====================
-# RAG template for all retrievals
-RAG_TEMPLATE = """\
-You are a helpful and kind assistant. Use the context provided below to answer the question.
-
-If you do not know the answer, or are unsure, say you don't know.
-
-Query:
-{question}
-
-Context:
-{context}
-"""
-
-rag_prompt = ChatPromptTemplate.from_template(RAG_TEMPLATE)
-#chat_model = ChatOpenAI()
-chat_model = ChatOpenAI(model_name="gpt-4o")
-
-# Create a RAG chain that can be filtered by document type
-def create_rag_chain(doc_type=None):
-    """Create a RAG chain that can be filtered by document type (protocol/core_reference)"""
-    def retrieve_with_type(query):
-        docs = retrieve_documents(query, doc_type=doc_type)
-        return format_docs(docs)
-    
-    chain = (
-        {"context": lambda x: retrieve_with_type(x["question"]), 
-         "question": itemgetter("question")}
-        | rag_prompt 
-        | chat_model
-        | StrOutputParser()
-    )
-    
-    return chain
-
-# Initialize the core reference retriever
-vectorstore = initialize_core_reference_embeddings()
-if vectorstore:
-    core_reference_retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
-    print("Core reference retriever created successfully.")
-else:
-    print("Failed to create core reference retriever: No vector store available.")
-
-# Chain for retrieving from core reference embeddings
-core_reference_retrieval_chain = (
-    {"context": itemgetter("question") | core_reference_retriever | format_docs, 
-     "question": itemgetter("question")}
-    | rag_prompt 
-    | chat_model
-    | StrOutputParser()
-)
+    protocol_retriever = protocol_vectorstore.as_retriever(search_kwargs={"k": k})
+    return protocol_retriever.invoke(query)
 
 # ==================== TOOL DEFINITIONS ====================
 @tool
@@ -693,23 +689,20 @@ async def on_chat_start():
     session_qdrant_client = create_session_qdrant_client()
     cl.user_session.set("session_qdrant_client", session_qdrant_client)
     
-    # Create a retriever for the core embeddings
-    global core_vectorstore
-    if core_vectorstore:
-        core_retriever = core_vectorstore.as_retriever()
-        cl.user_session.set("core_retriever", core_retriever)
-    
-    # Welcome message
-    welcome_msg = cl.Message(content="Welcome! Please upload a NIH HEAL protocol PDF file to get started.")
-    await welcome_msg.send()
+    # No need to initialize core_vectorstore here anymore
+    # Just use the global one that was initialized at startup
     
     # Wait for file upload
     files = await cl.AskFileMessage(
-        content="Please upload a NIH HEAL protocol PDF file to analyze alongside the core reference data.",
+        content="Please upload a single NIH HEAL Protocol PDF file for analysis.",
         accept=["application/pdf"],
+        max_files=1,
         max_size_mb=20,
         timeout=180,
     ).send()
+    if len(files) != 1:
+        await cl.Message("Error: You must upload exactly one PDF file.").send()
+        return    
     
     if files:
         processing_msg = cl.Message(content="Processing your protocol PDF file...")
