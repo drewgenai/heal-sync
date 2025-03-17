@@ -44,7 +44,31 @@ PDF_MODEL_ID = "pritamdeka/S-PubMedBert-MS-MARCO"
 INSTRUMENT_SEARCH_LLM = "gpt-4o"  # LLM for searching instruments
 INSTRUMENT_ANALYSIS_LLM = "gpt-4o"  # LLM for analyzing all domains
 
+# Add this after the other global variables
+pdf_embedding_model = None
+xlsx_embedding_model = None
 
+# Add this utility function before the initialize_embedding_models function
+def get_embedding_model(model_id):
+    """Creates and returns the appropriate embedding model based on the model ID."""
+    if "text-embedding" in model_id:
+        # OpenAI embeddings
+        from langchain_openai import OpenAIEmbeddings
+        return OpenAIEmbeddings(model=model_id)
+    else:
+        # HuggingFace embeddings
+        return HuggingFaceEmbeddings(model_name=model_id)
+
+# Initialize embedding models
+def initialize_embedding_models():
+    """Initialize the embedding models once at startup"""
+    global pdf_embedding_model, xlsx_embedding_model
+    pdf_embedding_model = get_embedding_model(PDF_MODEL_ID)
+    xlsx_embedding_model = get_embedding_model(XLSX_MODEL_ID)
+    print(f"Initialized embedding models: {PDF_MODEL_ID} and {XLSX_MODEL_ID}")
+
+# Call this function after loading environment variables
+initialize_embedding_models()
 
 # Make sure upload directory exists
 os.makedirs(UPLOAD_PATH, exist_ok=True)
@@ -68,19 +92,6 @@ qdrant_client = QdrantClient(":memory:")
 
 # Create a semantic splitter for PDF documents
 semantic_splitter = RecursiveCharacterTextSplitter(chunk_size=512, chunk_overlap=50)
-
-
-# Add this utility function after the other utility functions
-def get_embedding_model(model_id):
-    """Creates and returns the appropriate embedding model based on the model ID."""
-    if "text-embedding" in model_id:
-        # OpenAI embeddings
-        from langchain_openai import OpenAIEmbeddings
-        return OpenAIEmbeddings(model=model_id)
-    else:
-        # HuggingFace embeddings
-        return HuggingFaceEmbeddings(model_name=model_id)
-
 
 # Utility functions
 def load_and_chunk_excel_files():
@@ -117,24 +128,17 @@ def load_and_chunk_excel_files():
 
 def embed_chunks_in_qdrant(chunks):
     """Embeds document chunks and stores them in Qdrant."""
+    global xlsx_embedding_model
+    
     if not chunks:
         print("No Excel files found to process or all files were empty.")
         return None
 
-    # Create embeddings model based on the configured model ID
-    if "text-embedding" in XLSX_MODEL_ID:
-        # OpenAI embeddings
-        from langchain_openai import OpenAIEmbeddings
-        xlsx_model = OpenAIEmbeddings(model=XLSX_MODEL_ID)
-    else:
-        # HuggingFace embeddings
-        xlsx_model = HuggingFaceEmbeddings(model_name=XLSX_MODEL_ID)
-    
     print(f"Using embedding model: {XLSX_MODEL_ID}")
     print("Creating vector store...")
     vector_store = QdrantVectorStore.from_documents(
         documents=chunks,
-        embedding=xlsx_model,
+        embedding=xlsx_embedding_model,
         location=":memory:",
         collection_name=INITIAL_EMBEDDINGS_NAME
     )
@@ -191,12 +195,12 @@ def get_embedding_dimensions(model_id):
 
 async def embed_pdf_chunks_in_qdrant(documents_with_metadata, model_name=PDF_MODEL_ID):
     """Create a vector store and embed PDF chunks into Qdrant."""
+    global pdf_embedding_model
+    
     if not documents_with_metadata:
         print("No documents to embed")
         return None
         
-    # Create a new embeddings model
-    pdf_model = get_embedding_model(model_name)
     print(f"Using embedding model: {model_name}")
     
     try:
@@ -205,10 +209,8 @@ async def embed_pdf_chunks_in_qdrant(documents_with_metadata, model_name=PDF_MOD
             qdrant_client.delete_collection(USER_EMBEDDINGS_NAME)
             
         # Create the collection with proper parameters
-        # Get the embedding dimension by creating a sample embedding
-        sample_text = "Sample text to determine embedding dimension"
-        sample_embedding = pdf_model.embed_query(sample_text)
-        embedding_dimension = len(sample_embedding)
+        # Get the embedding dimension from the model
+        embedding_dimension = len(pdf_embedding_model.embed_query("Sample text"))
         
         qdrant_client.create_collection(
             collection_name=USER_EMBEDDINGS_NAME,
@@ -219,7 +221,7 @@ async def embed_pdf_chunks_in_qdrant(documents_with_metadata, model_name=PDF_MOD
         user_vectorstore = QdrantVectorStore(
             client=qdrant_client,
             collection_name=USER_EMBEDDINGS_NAME,
-            embedding=pdf_model
+            embedding=pdf_embedding_model
         )
         
         # Add documents to the vector store
@@ -287,15 +289,9 @@ initialembeddings_retrieval_chain = (
 # Tool definitions
 @tool
 def search_excel_data(query: str, top_k: int = 3) -> str:
-    """Search both Excel data and user-uploaded PDF data for information related to the query.
+    """Search both Excel data and user-uploaded PDF data for information related to the query."""
+    global pdf_embedding_model
     
-    Args:
-        query: The search query
-        top_k: Number of results to return (default: 3)
-        
-    Returns:
-        String containing the search results with their content and source files
-    """
     # Use the existing initialembeddings_retrieval_chain
     result = initialembeddings_retrieval_chain.invoke({"question": query})
     
@@ -310,7 +306,7 @@ def search_excel_data(query: str, top_k: int = 3) -> str:
         user_retriever = QdrantVectorStore(
             client=qdrant_client,
             collection_name=USER_EMBEDDINGS_NAME,
-            embedding=get_embedding_model(PDF_MODEL_ID)  # Still need embedding model for retrieval
+            embedding=pdf_embedding_model  # Use the global model
         ).as_retriever(search_kwargs={"k": top_k})
         
         user_retrieval_chain = (
@@ -390,15 +386,9 @@ def load_and_embed_protocol_pdf(file_path: str = None) -> str:
 
 @tool
 def search_protocol(query: str, top_k: int = 5) -> str:
-    """Search the protocol for information related to the query.
+    """Search the protocol for information related to the query."""
+    global pdf_embedding_model
     
-    Args:
-        query: The search query
-        top_k: Number of results to return (default: 5)
-        
-    Returns:
-        String containing the search results with their content and source files
-    """
     try:
         # Check if user collection exists
         if USER_EMBEDDINGS_NAME not in [c.name for c in qdrant_client.get_collections().collections]:
@@ -408,7 +398,7 @@ def search_protocol(query: str, top_k: int = 5) -> str:
         user_retriever = QdrantVectorStore(
             client=qdrant_client,
             collection_name=USER_EMBEDDINGS_NAME,
-            embedding=get_embedding_model(PDF_MODEL_ID)  # Still need embedding model for retrieval
+            embedding=pdf_embedding_model  # Use the global model
         ).as_retriever(search_kwargs={"k": top_k})
         
         user_retrieval_chain = (
@@ -426,14 +416,9 @@ def search_protocol(query: str, top_k: int = 5) -> str:
 
 @tool
 def search_protocol_for_instruments(domain: str) -> dict:
-    """Search the protocol for instruments related to a specific NIH HEAL CDE core domain.
+    """Search the protocol for instruments related to a specific NIH HEAL CDE core domain."""
+    global pdf_embedding_model
     
-    Args:
-        domain: The NIH HEAL CDE core domain to search for
-        
-    Returns:
-        Dictionary containing the domain, identified instrument, and supporting context
-    """
     # Check if user collection exists
     try:
         # Check if collection exists
@@ -444,7 +429,7 @@ def search_protocol_for_instruments(domain: str) -> dict:
         user_retriever = QdrantVectorStore(
             client=qdrant_client,
             collection_name=USER_EMBEDDINGS_NAME,
-            embedding=get_embedding_model(PDF_MODEL_ID)  # Still need embedding model for retrieval
+            embedding=pdf_embedding_model  # Use the global model
         ).as_retriever(search_kwargs={"k": 10})
     except Exception as e:
         print(f"Error accessing user vector store: {str(e)}")
