@@ -104,8 +104,8 @@ def format_docs(docs):
     """Format a list of documents into a single string."""
     return "\n\n".join(doc.page_content for doc in docs)
 
-# ==================== EXCEL DOCUMENT PROCESSING ====================
-def load_and_chunk_excel_files():
+# ==================== CORE EMBEDDINGS PROCESSING ====================
+def load_and_chunk_core_reference_files():
     """Loads all .xlsx files from the initial embeddings directory and splits them into chunks."""
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=512, chunk_overlap=50)
     all_chunks = []
@@ -138,8 +138,8 @@ def load_and_chunk_excel_files():
     print(f"Processed {file_count} Excel files with a total of {len(all_chunks)} chunks.")
     return all_chunks
 
-def embed_chunks_in_qdrant(chunks):
-    """Embeds document chunks and stores them in Qdrant."""
+def embed_core_reference_in_qdrant(chunks):
+    """Embeds core reference chunks and stores them in Qdrant."""
     global embedding_model
     
     if not chunks:
@@ -168,14 +168,14 @@ def embed_chunks_in_qdrant(chunks):
         print(f"Embedding model status: {embedding_model is not None}")
         return None
 
-def process_initial_embeddings():
+def initialize_core_reference_embeddings():
     """Loads all .xlsx files, extracts text, embeds, and stores in Qdrant."""
-    chunks = load_and_chunk_excel_files()
-    return embed_chunks_in_qdrant(chunks)
+    chunks = load_and_chunk_core_reference_files()
+    return embed_core_reference_in_qdrant(chunks)
 
-# ==================== PDF DOCUMENT PROCESSING ====================
-async def load_and_chunk_pdf_files(files):
-    """Load PDF files and split them into chunks with metadata."""
+# ==================== PROTOCOL DOCUMENT PROCESSING ====================
+async def load_and_chunk_protocol_files(files):
+    """Load protocol PDF files and split them into chunks with metadata."""
     print(f"Loading {len(files)} uploaded PDF files")
     documents_with_metadata = []
     
@@ -212,8 +212,8 @@ async def load_and_chunk_pdf_files(files):
     
     return documents_with_metadata
 
-async def embed_pdf_chunks_in_qdrant(documents_with_metadata, model_name=EMBEDDING_MODEL_ID):
-    """Create a vector store and embed PDF chunks into Qdrant."""
+async def embed_protocol_in_qdrant(documents_with_metadata, model_name=EMBEDDING_MODEL_ID):
+    """Create a vector store and embed protocol chunks into Qdrant."""
     global embedding_model
     
     if not documents_with_metadata:
@@ -252,11 +252,10 @@ async def embed_pdf_chunks_in_qdrant(documents_with_metadata, model_name=EMBEDDI
         print(f"Error creating vector store: {str(e)}")
         return None
 
-async def process_uploaded_files(files, model_name=EMBEDDING_MODEL_ID):
-    """Process uploaded PDF files and add them to a separate vector store collection"""
-    documents_with_metadata = await load_and_chunk_pdf_files(files)
-    return await embed_pdf_chunks_in_qdrant(documents_with_metadata, model_name)
-
+async def process_uploaded_protocol(files, model_name=EMBEDDING_MODEL_ID):
+    """Process uploaded protocol PDF files and add them to a separate vector store collection"""
+    documents_with_metadata = await load_and_chunk_protocol_files(files)
+    return await embed_protocol_in_qdrant(documents_with_metadata, model_name)
 
 # ==================== RETRIEVAL FUNCTIONS ====================
 def retrieve_documents(query, doc_type=None, k=5):
@@ -309,17 +308,17 @@ def create_rag_chain(doc_type=None):
     
     return chain
 
-# Initialize the Excel retriever
-vectorstore = process_initial_embeddings()
+# Initialize the core reference retriever
+vectorstore = initialize_core_reference_embeddings()
 if vectorstore:
-    excel_retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
-    print("Excel retriever created successfully.")
+    core_reference_retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
+    print("Core reference retriever created successfully.")
 else:
-    print("Failed to create Excel retriever: No vector store available.")
+    print("Failed to create core reference retriever: No vector store available.")
 
-# Chain for retrieving from Excel embeddings
-initialembeddings_retrieval_chain = (
-    {"context": itemgetter("question") | excel_retriever | format_docs, 
+# Chain for retrieving from core reference embeddings
+core_reference_retrieval_chain = (
+    {"context": itemgetter("question") | core_reference_retriever | format_docs, 
      "question": itemgetter("question")}
     | rag_prompt 
     | chat_model
@@ -328,8 +327,8 @@ initialembeddings_retrieval_chain = (
 
 # ==================== TOOL DEFINITIONS ====================
 @tool
-def search_data(query: str, doc_type: str = None) -> str:
-    """Search all data or filter by document type (pdf/excel)"""
+def search_all_data(query: str, doc_type: str = None) -> str:
+    """Search all data or filter by document type (protocol/core_reference)"""
     try:
         chain = create_rag_chain(doc_type)
         return chain.invoke({"question": query})
@@ -337,18 +336,18 @@ def search_data(query: str, doc_type: str = None) -> str:
         return f"Error searching data: {str(e)}"
 
 @tool
-def search_excel_data(query: str, top_k: int = 3) -> str:
-    """Search both Excel data and user-uploaded PDF data for information related to the query."""
+def search_core_reference(query: str, top_k: int = 3) -> str:
+    """Search core reference data and protocol data for information related to the query."""
     global embedding_model
     
-    # Use the existing initialembeddings_retrieval_chain
-    result = initialembeddings_retrieval_chain.invoke({"question": query})
+    # Use the existing core_reference_retrieval_chain
+    result = core_reference_retrieval_chain.invoke({"question": query})
     
     # If we have a user collection, also search that
     try:
         # Check if user collection exists
         if USER_EMBEDDINGS_NAME not in [c.name for c in qdrant_client.get_collections().collections]:
-            # If no user collection exists yet, just return Excel results
+            # If no user collection exists yet, just return core reference results
             return result
             
         # Create a retrieval chain for user documents
@@ -369,14 +368,15 @@ def search_excel_data(query: str, top_k: int = 3) -> str:
         user_result = user_retrieval_chain.invoke({"question": query})
         
         # Combine results
-        return f"From Excel files:\n{result}\n\nFrom your uploaded PDF:\n{user_result}"
+        return f"From core reference files:\n{result}\n\nFrom your uploaded PDF:\n{user_result}"
     except Exception as e:
         print(f"Error searching user vector store: {str(e)}")
-        # If error occurs, just return Excel results
+        # If error occurs, just return core reference results
         return result
 
 @tool
-def load_and_embed_protocol_pdf(file_path: str = None) -> str:
+def load_and_embed_protocol(file_path: str = None) -> str:
+    """Load and embed a protocol PDF file into the vector store."""
     """Load and embed a protocol PDF file into the vector store.
     
     Args:
@@ -423,8 +423,8 @@ def load_and_embed_protocol_pdf(file_path: str = None) -> str:
         
         # Process the files asynchronously
         import asyncio
-        documents_with_metadata = asyncio.run(load_and_chunk_pdf_files(files))
-        user_vectorstore = asyncio.run(embed_pdf_chunks_in_qdrant(documents_with_metadata, EMBEDDING_MODEL_ID))
+        documents_with_metadata = asyncio.run(load_and_chunk_protocol_files(files))
+        user_vectorstore = asyncio.run(embed_protocol_in_qdrant(documents_with_metadata, EMBEDDING_MODEL_ID))
         
         if user_vectorstore:
             return f"Successfully embedded {len(documents_with_metadata)} chunks from {len(files)} protocol document(s)."
@@ -432,7 +432,6 @@ def load_and_embed_protocol_pdf(file_path: str = None) -> str:
             return "Failed to embed protocol document(s)."
     except Exception as e:
         return f"Error embedding protocol document: {str(e)}"
-
 
 @tool
 def search_protocol_for_instruments(domain: str) -> dict:
@@ -466,9 +465,9 @@ def search_protocol_for_instruments(domain: str) -> dict:
         docs = user_retriever.invoke(query)
         protocol_context = format_docs(docs)
         
-        # Search for instruments in the Excel data that match this domain
-        excel_query = f"What are standard instruments or measures for {domain}?"
-        excel_instruments = initialembeddings_retrieval_chain.invoke({"question": excel_query})
+        # Search for instruments in the core reference data that match this domain
+        core_reference_query = f"What are standard instruments or measures for {domain}?"
+        core_reference_instruments = core_reference_retrieval_chain.invoke({"question": core_reference_query})
         
         # Use the model to identify the most likely instrument for this domain
         prompt = f"""
@@ -478,7 +477,7 @@ def search_protocol_for_instruments(domain: str) -> dict:
         {protocol_context}
         
         Known instruments for this domain:
-        {excel_instruments}
+        {core_reference_instruments}
         
         Respond with only the name of the identified instrument. If you cannot identify a specific instrument, respond with "Not identified".
         """
@@ -490,21 +489,15 @@ def search_protocol_for_instruments(domain: str) -> dict:
             "domain": domain,
             "instrument": instrument.strip(),
             "context": protocol_context,
-            "known_instruments": excel_instruments
+            "known_instruments": core_reference_instruments
         }
     except Exception as e:
         print(f"Error identifying instrument for {domain}: {str(e)}")
         return {"domain": domain, "instrument": "Error during identification", "context": str(e)}
 
-
-
 @tool
-def analyze_all_heal_domains() -> str:
-    """Analyze all NIH HEAL CDE core domains and identify instruments used in the protocol.
-    
-    Returns:
-        Markdown formatted table of domains and identified instruments
-    """
+def analyze_protocol_domains() -> str:
+    """Analyze all NIH HEAL CDE core domains and identify instruments used in the protocol."""
     # Check if protocol document exists
     uploaded_files = [f for f in os.listdir(UPLOAD_PATH) if f.endswith('.pdf')]
     if not uploaded_files:
@@ -529,18 +522,19 @@ def analyze_all_heal_domains() -> str:
     
     return result
 
-
 @tool
-def format_instrument_analysis(analysis_results: list, title: str = "NIH HEAL CDE Core Domains Analysis") -> str:
-    """Format instrument analysis results into a markdown table.
-    
-    Args:
+def format_domain_analysis(analysis_results: list, title: str = "NIH HEAL CDE Core Domains Analysis") -> str:
+    """Format domain analysis results into a markdown table.
+        Args:
         analysis_results: List of dictionaries with domain and instrument information
         title: Title for the markdown output
         
     Returns:
         Markdown formatted table of domains and identified instruments
+
+    
     """
+  
     # Format the results as a markdown table
     result = f"# {title}\n\n"
     result += "| Domain | Protocol Instrument |\n"
@@ -555,12 +549,12 @@ def format_instrument_analysis(analysis_results: list, title: str = "NIH HEAL CD
 
 # Collect all tools
 tools = [
-    search_data,
-    search_excel_data,
-    load_and_embed_protocol_pdf,
+    search_all_data,
+    search_core_reference,
+    load_and_embed_protocol,
     search_protocol_for_instruments, 
-    analyze_all_heal_domains,
-    format_instrument_analysis
+    analyze_protocol_domains,
+    format_domain_analysis
 ]
 
 # ==================== LANGGRAPH SETUP ====================
@@ -572,23 +566,23 @@ final_model = ChatOpenAI(model_name=INSTRUMENT_ANALYSIS_LLM, temperature=0)
 system_message = """You are a helpful assistant specializing in NIH HEAL CDE protocols.
 
 You have access to:
-1. Excel data through the search_excel_data tool
-2. A tool to load and embed protocol PDFs (load_and_embed_protocol_pdf)
-3. A tool to search protocol documents for general information (search_protocol)
-4. A tool to search for instruments in protocols for specific domains (search_protocol_for_instruments)
-5. A tool to analyze all NIH HEAL domains at once (analyze_all_heal_domains)
-6. A tool to format analysis results into a markdown table (format_instrument_analysis)
+1. Core reference data through the search_core_reference tool
+2. A tool to load and embed protocol PDFs (load_and_embed_protocol)
+3. A tool to search for instruments in protocols for specific domains (search_protocol_for_instruments)
+4. A tool to analyze all NIH HEAL domains at once (analyze_protocol_domains)
+5. A tool to format analysis results into a markdown table (format_domain_analysis)
+6. A tool to search all available data (search_all_data)
 
 WHEN TO USE TOOLS:
-- When users upload a protocol PDF, use the load_and_embed_protocol_pdf tool.
-- When users ask general questions about the protocol, use the search_protocol tool.
+- When users upload a protocol PDF, use the load_and_embed_protocol tool.
+- When users ask general questions about the protocol, use the search_all_data tool.
 - When users ask about a specific instrument for a domain, use the search_protocol_for_instruments tool.
-- When users want a complete analysis of all domains, use the analyze_all_heal_domains tool.
-- When users ask about data or information in the Excel files, use the search_excel_data tool.
-- When you have multiple analysis results to present, use format_instrument_analysis to create a nice table.
+- When users want a complete analysis of all domains, use the analyze_protocol_domains tool.
+- When users ask about data or information in the core reference files, use the search_core_reference tool.
+- When you have multiple analysis results to present, use format_domain_analysis to create a nice table.
 
 Be specific in your tool queries to get the most relevant information.
-Always use the appropriate tool before responding to questions about the protocol or Excel data.
+Always use the appropriate tool before responding to questions about the protocol or core reference data.
 """
 
 # Bind tools and configure models
@@ -654,7 +648,7 @@ async def on_chat_start():
     
     # Wait for file upload
     files = await cl.AskFileMessage(
-        content="Please upload a NIH HEAL protocol PDF file to analyze alongside the Excel data.",
+        content="Please upload a NIH HEAL protocol PDF file to analyze alongside the core reference data.",
         accept=["application/pdf"],
         max_size_mb=20,
         timeout=180,
@@ -665,14 +659,14 @@ async def on_chat_start():
         await processing_msg.send()
         
         # Process the uploaded files
-        documents_with_metadata = await load_and_chunk_pdf_files(files)
-        user_vectorstore = await embed_pdf_chunks_in_qdrant(documents_with_metadata)
+        documents_with_metadata = await load_and_chunk_protocol_files(files)
+        user_vectorstore = await embed_protocol_in_qdrant(documents_with_metadata)
         
         if user_vectorstore:
             analysis_msg = cl.Message(content="Analyzing your protocol to identify instruments (CRF questionaires) for NIH HEAL CDE core domains...")
             await analysis_msg.send()
             
-            # Use the analyze_all_heal_domains tool to analyze the protocol
+            # Use the analyze_protocol_domains tool to analyze the protocol
             config = {"configurable": {"thread_id": cl.context.session.id}}
             
             # Create a message to trigger the analysis
@@ -694,11 +688,11 @@ async def on_chat_start():
             
             await final_answer.send()
             
-            await cl.Message(content="You can now ask additional questions about the protocol or the Excel data.").send()
+            await cl.Message(content="You can now ask additional questions about the protocol or the core reference data.").send()
         else:
             await cl.Message(content="There was an issue processing your PDF. Please try uploading again.").send()
     else:
-        await cl.Message(content="No file was uploaded. You can still ask questions about the Excel data.").send()
+        await cl.Message(content="No file was uploaded. You can still ask questions about the core reference data.").send()
 
 @cl.on_message
 async def on_message(msg: cl.Message):
