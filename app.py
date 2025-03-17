@@ -42,17 +42,17 @@ USER_EMBEDDINGS_NAME = "user_embeddings"
 os.makedirs(UPLOAD_PATH, exist_ok=True)
 
 # NIH HEAL CDE core domains
-NIH_HEAL_DOMAINS = [
-    "Pain intensity",
-    "Pain interference",
-    "Physical functioning/quality of life (QoL)",
-    "Sleep",
-    "Pain catastrophizing",
-    "Depression",
+NIH_HEAL_CORE_DOMAINS = [
     "Anxiety",
+    "Depression",
     "Global satisfaction with treatment",
-    "Substance Use Screener",
-    "Quality of Life (QoL)"
+    "Pain catastrophizing",
+    "Pain interference",
+    "Pain intensity",
+    "Physical functioning",
+    "Quality of Life (QoL)",
+    "Sleep",
+    "Substance Use Screener"
 ]
 
 # Initialize Qdrant (in-memory)
@@ -289,7 +289,7 @@ def search_excel_data(query: str, top_k: int = 3) -> str:
 
 @tool
 def identify_heal_instruments(protocol_text: str = "") -> str:
-    """Identify instruments used in the protocol for each NIH HEAL CDE core domain.
+    """Identify instruments (CRF questionaires) used in the protocol for each NIH HEAL CDE core domain.
     
     Args:
         protocol_text: Optional text from the protocol to analyze
@@ -318,7 +318,7 @@ def identify_heal_instruments(protocol_text: str = "") -> str:
     # For each domain, search for relevant instruments
     domain_instruments = {}
     
-    for domain in NIH_HEAL_DOMAINS:
+    for domain in NIH_HEAL_CORE_DOMAINS:
         # Search for instruments related to this domain in the protocol
         query = f"What instrument or measure is used for {domain} in the protocol?"
         
@@ -372,7 +372,7 @@ system_message = """You are a helpful assistant specializing in NIH HEAL CDE pro
 
 You have access to:
 1. Excel data through the search_excel_data tool
-2. A tool to identify instruments in NIH HEAL protocols (identify_heal_instruments)
+2. A tool to identify instruments (CRF questionaires) in NIH HEAL protocols (identify_heal_instruments)
 
 WHEN TO USE TOOLS:
 - When users ask about instruments, measures, assessments, questionnaires, or scales in a protocol, use the identify_heal_instruments tool.
@@ -460,14 +460,14 @@ async def on_chat_start():
         user_vectorstore = await process_uploaded_files(files)
         
         if user_vectorstore:
-            analysis_msg = cl.Message(content="Analyzing your protocol to identify instruments for NIH HEAL CDE core domains...")
+            analysis_msg = cl.Message(content="Analyzing your protocol to identify instruments (CRF questionaires) for NIH HEAL CDE core domains...")
             await analysis_msg.send()
             
             # Use the identify_heal_instruments tool to analyze the protocol
             config = {"configurable": {"thread_id": cl.context.session.id}}
             
             # Create a message to trigger the analysis
-            analysis_request = HumanMessage(content="Please analyze the uploaded protocol and identify instruments for each NIH HEAL CDE core domain.")
+            analysis_request = HumanMessage(content="Please analyze the uploaded protocol and identify instruments (CRF questionaires) for each NIH HEAL CDE core domain.")
             
             final_answer = cl.Message(content="")
             
