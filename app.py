@@ -30,48 +30,19 @@ from langchain_core.output_parsers import StrOutputParser
 # Load environment variables
 load_dotenv()
 
-# Constants
+# ==================== CONSTANTS ====================
+# Paths and directories
 UPLOAD_PATH = "./uploads"
 INITIAL_EMBEDDINGS_DIR = "./initial_embeddings"
 INITIAL_EMBEDDINGS_NAME = "initial_embeddings"
 USER_EMBEDDINGS_NAME = "user_embeddings"
+VECTOR_STORE_COLLECTION = "documents"
 
-#XLSX_MODEL_ID = "Snowflake/snowflake-arctic-embed-m"
-XLSX_MODEL_ID = "pritamdeka/S-PubMedBert-MS-MARCO"
-#PDF_MODEL_ID = "Snowflake/snowflake-arctic-embed-m"
-PDF_MODEL_ID = "pritamdeka/S-PubMedBert-MS-MARCO"
-
+# Model IDs
+EMBEDDING_MODEL_ID = "pritamdeka/S-PubMedBert-MS-MARCO"
+#EMBEDDING_MODEL_ID = "Snowflake/snowflake-arctic-embed-m"
 INSTRUMENT_SEARCH_LLM = "gpt-4o"  # LLM for searching instruments
 INSTRUMENT_ANALYSIS_LLM = "gpt-4o"  # LLM for analyzing all domains
-
-# Add this after the other global variables
-pdf_embedding_model = None
-xlsx_embedding_model = None
-
-# Add this utility function before the initialize_embedding_models function
-def get_embedding_model(model_id):
-    """Creates and returns the appropriate embedding model based on the model ID."""
-    if "text-embedding" in model_id:
-        # OpenAI embeddings
-        from langchain_openai import OpenAIEmbeddings
-        return OpenAIEmbeddings(model=model_id)
-    else:
-        # HuggingFace embeddings
-        return HuggingFaceEmbeddings(model_name=model_id)
-
-# Initialize embedding models
-def initialize_embedding_models():
-    """Initialize the embedding models once at startup"""
-    global pdf_embedding_model, xlsx_embedding_model
-    pdf_embedding_model = get_embedding_model(PDF_MODEL_ID)
-    xlsx_embedding_model = get_embedding_model(XLSX_MODEL_ID)
-    print(f"Initialized embedding models: {PDF_MODEL_ID} and {XLSX_MODEL_ID}")
-
-# Call this function after loading environment variables
-initialize_embedding_models()
-
-# Make sure upload directory exists
-os.makedirs(UPLOAD_PATH, exist_ok=True)
 
 # NIH HEAL CDE core domains
 NIH_HEAL_CORE_DOMAINS = [
@@ -87,13 +58,53 @@ NIH_HEAL_CORE_DOMAINS = [
     "Substance Use Screener"
 ]
 
+# Make sure upload directory exists
+os.makedirs(UPLOAD_PATH, exist_ok=True)
+
+# ==================== EMBEDDING MODEL SETUP ====================
+def get_embedding_model(model_id):
+    """Creates and returns the appropriate embedding model based on the model ID."""
+    if "text-embedding" in model_id:
+        # OpenAI embeddings
+        from langchain_openai import OpenAIEmbeddings
+        return OpenAIEmbeddings(model=model_id)
+    else:
+        # HuggingFace embeddings
+        return HuggingFaceEmbeddings(model_name=model_id)
+
+def initialize_embedding_models():
+    """Initialize a single embedding model for all document types"""
+    global embedding_model
+    
+    # Initialize a single model for all document types
+    embedding_model = get_embedding_model(EMBEDDING_MODEL_ID)
+    
+    print(f"Initialized embedding model: {EMBEDDING_MODEL_ID}")
+
+# Initialize the embedding model
+initialize_embedding_models()
+
+# Get embedding dimensions utility
+def get_embedding_dimensions(model_id):
+    """Gets the dimensions of embeddings from a specific model."""
+    model = get_embedding_model(model_id)
+    sample_text = "Sample text to determine embedding dimension"
+    sample_embedding = model.embed_query(sample_text)
+    return len(sample_embedding)
+
+# ==================== QDRANT SETUP ====================
 # Initialize Qdrant (in-memory)
 qdrant_client = QdrantClient(":memory:")
 
-# Create a semantic splitter for PDF documents
+# ==================== DOCUMENT PROCESSING ====================
+# Create a semantic splitter for documents
 semantic_splitter = RecursiveCharacterTextSplitter(chunk_size=512, chunk_overlap=50)
 
-# Utility functions
+def format_docs(docs):
+    """Format a list of documents into a single string."""
+    return "\n\n".join(doc.page_content for doc in docs)
+
+# ==================== EXCEL DOCUMENT PROCESSING ====================
 def load_and_chunk_excel_files():
     """Loads all .xlsx files from the initial embeddings directory and splits them into chunks."""
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=512, chunk_overlap=50)
@@ -115,6 +126,7 @@ def load_and_chunk_excel_files():
                 for chunk in chunks:
                     chunk.metadata = chunk.metadata or {}
                     chunk.metadata["filename"] = file
+                    chunk.metadata["type"] = "excel"  # Add document type
                 
                 all_chunks.extend(chunks)
                 file_count += 1
@@ -128,31 +140,40 @@ def load_and_chunk_excel_files():
 
 def embed_chunks_in_qdrant(chunks):
     """Embeds document chunks and stores them in Qdrant."""
-    global xlsx_embedding_model
+    global embedding_model
     
     if not chunks:
         print("No Excel files found to process or all files were empty.")
         return None
 
-    print(f"Using embedding model: {XLSX_MODEL_ID}")
+    # Ensure we have a valid embedding model
+    if embedding_model is None:
+        print("ERROR: No embedding model available. Initializing now.")
+        initialize_embedding_models()
+        
+    print(f"Using embedding model: {EMBEDDING_MODEL_ID}")
     print("Creating vector store...")
-    vector_store = QdrantVectorStore.from_documents(
-        documents=chunks,
-        embedding=xlsx_embedding_model,
-        location=":memory:",
-        collection_name=INITIAL_EMBEDDINGS_NAME
-    )
-    print(f"Successfully loaded all .xlsx files into Qdrant collection '{INITIAL_EMBEDDINGS_NAME}'.")
-    return vector_store
+    
+    try:
+        vector_store = QdrantVectorStore.from_documents(
+            documents=chunks,
+            embedding=embedding_model,
+            location=":memory:",
+            collection_name=INITIAL_EMBEDDINGS_NAME
+        )
+        print(f"Successfully loaded all .xlsx files into Qdrant collection '{INITIAL_EMBEDDINGS_NAME}'.")
+        return vector_store
+    except Exception as e:
+        print(f"Error creating vector store: {str(e)}")
+        print(f"Embedding model status: {embedding_model is not None}")
+        return None
 
 def process_initial_embeddings():
     """Loads all .xlsx files, extracts text, embeds, and stores in Qdrant."""
     chunks = load_and_chunk_excel_files()
     return embed_chunks_in_qdrant(chunks)
 
-def format_docs(docs):
-    return "\n\n".join(doc.page_content for doc in docs)
-
+# ==================== PDF DOCUMENT PROCESSING ====================
 async def load_and_chunk_pdf_files(files):
     """Load PDF files and split them into chunks with metadata."""
     print(f"Loading {len(files)} uploaded PDF files")
@@ -176,7 +197,13 @@ async def load_and_chunk_pdf_files(files):
                 source_name = file.name
                 chunks = semantic_splitter.split_text(doc.page_content)
                 for chunk in chunks:
-                    doc_chunk = Document(page_content=chunk, metadata={"source": source_name})
+                    doc_chunk = Document(
+                        page_content=chunk, 
+                        metadata={
+                            "source": source_name,
+                            "type": "pdf"  # Add document type
+                        }
+                    )
                     documents_with_metadata.append(doc_chunk)
                     
             print(f"Successfully processed {file.name}, extracted {len(documents_with_metadata)} chunks")
@@ -185,17 +212,9 @@ async def load_and_chunk_pdf_files(files):
     
     return documents_with_metadata
 
-# Add this utility function to get vector dimensions
-def get_embedding_dimensions(model_id):
-    """Gets the dimensions of embeddings from a specific model."""
-    model = get_embedding_model(model_id)
-    sample_text = "Sample text to determine embedding dimension"
-    sample_embedding = model.embed_query(sample_text)
-    return len(sample_embedding)
-
-async def embed_pdf_chunks_in_qdrant(documents_with_metadata, model_name=PDF_MODEL_ID):
+async def embed_pdf_chunks_in_qdrant(documents_with_metadata, model_name=EMBEDDING_MODEL_ID):
     """Create a vector store and embed PDF chunks into Qdrant."""
-    global pdf_embedding_model
+    global embedding_model
     
     if not documents_with_metadata:
         print("No documents to embed")
@@ -210,7 +229,7 @@ async def embed_pdf_chunks_in_qdrant(documents_with_metadata, model_name=PDF_MOD
             
         # Create the collection with proper parameters
         # Get the embedding dimension from the model
-        embedding_dimension = len(pdf_embedding_model.embed_query("Sample text"))
+        embedding_dimension = len(embedding_model.embed_query("Sample text"))
         
         qdrant_client.create_collection(
             collection_name=USER_EMBEDDINGS_NAME,
@@ -221,7 +240,7 @@ async def embed_pdf_chunks_in_qdrant(documents_with_metadata, model_name=PDF_MOD
         user_vectorstore = QdrantVectorStore(
             client=qdrant_client,
             collection_name=USER_EMBEDDINGS_NAME,
-            embedding=pdf_embedding_model
+            embedding=embedding_model
         )
         
         # Add documents to the vector store
@@ -233,34 +252,31 @@ async def embed_pdf_chunks_in_qdrant(documents_with_metadata, model_name=PDF_MOD
         print(f"Error creating vector store: {str(e)}")
         return None
 
-async def process_uploaded_files(files, model_name=PDF_MODEL_ID):
+async def process_uploaded_files(files, model_name=EMBEDDING_MODEL_ID):
     """Process uploaded PDF files and add them to a separate vector store collection"""
     documents_with_metadata = await load_and_chunk_pdf_files(files)
     return await embed_pdf_chunks_in_qdrant(documents_with_metadata, model_name)
 
-# Data processing and initialization
-vectorstore = process_initial_embeddings()
 
-# Create retrievers for each collection
-if vectorstore:
-    # Retriever for initial Excel embeddings
-    excel_retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
-    print("Excel retriever created successfully.")
-else:
-    print("Failed to create Excel retriever: No vector store available.")
+# ==================== RETRIEVAL FUNCTIONS ====================
+def retrieve_documents(query, doc_type=None, k=5):
+    """Retrieve documents, optionally filtering by document type"""
+    vector_store = QdrantVectorStore(
+        client=qdrant_client,
+        collection_name=VECTOR_STORE_COLLECTION,
+        embedding=embedding_model
+    )
+    
+    # Set up filter if doc_type is specified
+    search_kwargs = {"k": k}
+    if doc_type:
+        search_kwargs["filter"] = {"type": doc_type}
+        
+    retriever = vector_store.as_retriever(search_kwargs=search_kwargs)
+    return retriever.invoke(query)
 
-# The PDF retriever is created dynamically when files are uploaded
-# in the embed_pdf_chunks_in_qdrant function:
-#
-# user_vectorstore = QdrantVectorStore(
-#     client=qdrant_client,
-#     collection_name=USER_EMBEDDINGS_NAME,
-#     embedding=pdf_model
-# )
-# 
-# user_retriever = user_vectorstore.as_retriever(search_kwargs={"k": top_k})
-
-# RAG setup for Excel data
+# ==================== RAG SETUP ====================
+# RAG template for all retrievals
 RAG_TEMPLATE = """\
 You are a helpful and kind assistant. Use the context provided below to answer the question.
 
@@ -274,8 +290,32 @@ Context:
 """
 
 rag_prompt = ChatPromptTemplate.from_template(RAG_TEMPLATE)
-
 chat_model = ChatOpenAI()
+
+# Create a RAG chain that can be filtered by document type
+def create_rag_chain(doc_type=None):
+    """Create a RAG chain that can be filtered by document type"""
+    def retrieve_with_type(query):
+        docs = retrieve_documents(query, doc_type=doc_type)
+        return format_docs(docs)
+    
+    chain = (
+        {"context": lambda x: retrieve_with_type(x["question"]), 
+         "question": itemgetter("question")}
+        | rag_prompt 
+        | chat_model
+        | StrOutputParser()
+    )
+    
+    return chain
+
+# Initialize the Excel retriever
+vectorstore = process_initial_embeddings()
+if vectorstore:
+    excel_retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
+    print("Excel retriever created successfully.")
+else:
+    print("Failed to create Excel retriever: No vector store available.")
 
 # Chain for retrieving from Excel embeddings
 initialembeddings_retrieval_chain = (
@@ -286,11 +326,20 @@ initialembeddings_retrieval_chain = (
     | StrOutputParser()
 )
 
-# Tool definitions
+# ==================== TOOL DEFINITIONS ====================
+@tool
+def search_data(query: str, doc_type: str = None) -> str:
+    """Search all data or filter by document type (pdf/excel)"""
+    try:
+        chain = create_rag_chain(doc_type)
+        return chain.invoke({"question": query})
+    except Exception as e:
+        return f"Error searching data: {str(e)}"
+
 @tool
 def search_excel_data(query: str, top_k: int = 3) -> str:
     """Search both Excel data and user-uploaded PDF data for information related to the query."""
-    global pdf_embedding_model
+    global embedding_model
     
     # Use the existing initialembeddings_retrieval_chain
     result = initialembeddings_retrieval_chain.invoke({"question": query})
@@ -306,7 +355,7 @@ def search_excel_data(query: str, top_k: int = 3) -> str:
         user_retriever = QdrantVectorStore(
             client=qdrant_client,
             collection_name=USER_EMBEDDINGS_NAME,
-            embedding=pdf_embedding_model  # Use the global model
+            embedding=embedding_model
         ).as_retriever(search_kwargs={"k": top_k})
         
         user_retrieval_chain = (
@@ -375,7 +424,7 @@ def load_and_embed_protocol_pdf(file_path: str = None) -> str:
         # Process the files asynchronously
         import asyncio
         documents_with_metadata = asyncio.run(load_and_chunk_pdf_files(files))
-        user_vectorstore = asyncio.run(embed_pdf_chunks_in_qdrant(documents_with_metadata, PDF_MODEL_ID))
+        user_vectorstore = asyncio.run(embed_pdf_chunks_in_qdrant(documents_with_metadata, EMBEDDING_MODEL_ID))
         
         if user_vectorstore:
             return f"Successfully embedded {len(documents_with_metadata)} chunks from {len(files)} protocol document(s)."
@@ -387,7 +436,7 @@ def load_and_embed_protocol_pdf(file_path: str = None) -> str:
 @tool
 def search_protocol(query: str, top_k: int = 5) -> str:
     """Search the protocol for information related to the query."""
-    global pdf_embedding_model
+    global embedding_model
     
     try:
         # Check if user collection exists
@@ -398,7 +447,7 @@ def search_protocol(query: str, top_k: int = 5) -> str:
         user_retriever = QdrantVectorStore(
             client=qdrant_client,
             collection_name=USER_EMBEDDINGS_NAME,
-            embedding=pdf_embedding_model  # Use the global model
+            embedding=embedding_model
         ).as_retriever(search_kwargs={"k": top_k})
         
         user_retrieval_chain = (
@@ -417,7 +466,7 @@ def search_protocol(query: str, top_k: int = 5) -> str:
 @tool
 def search_protocol_for_instruments(domain: str) -> dict:
     """Search the protocol for instruments related to a specific NIH HEAL CDE core domain."""
-    global pdf_embedding_model
+    global embedding_model
     
     # Check if user collection exists
     try:
@@ -429,7 +478,7 @@ def search_protocol_for_instruments(domain: str) -> dict:
         user_retriever = QdrantVectorStore(
             client=qdrant_client,
             collection_name=USER_EMBEDDINGS_NAME,
-            embedding=pdf_embedding_model  # Use the global model
+            embedding=embedding_model
         ).as_retriever(search_kwargs={"k": 10})
     except Exception as e:
         print(f"Error accessing user vector store: {str(e)}")
@@ -477,6 +526,44 @@ def search_protocol_for_instruments(domain: str) -> dict:
         return {"domain": domain, "instrument": "Error during identification", "context": str(e)}
 
 @tool
+def analyze_domain(domain: str) -> dict:
+    """Analyze a specific NIH HEAL CDE core domain"""
+    # Query for this specific domain
+    query = f"What instrument or measure is used for {domain} in the protocol?"
+    
+    # Get protocol context
+    protocol_docs = retrieve_documents(query, doc_type="pdf", k=5)
+    protocol_context = format_docs(protocol_docs)
+    
+    # Get known instruments from Excel data
+    excel_query = f"What are standard instruments or measures for {domain}?"
+    excel_docs = retrieve_documents(excel_query, doc_type="excel", k=5)
+    excel_context = format_docs(excel_docs)
+    
+    # Use the model to identify the instrument
+    prompt = f"""
+    Based on the protocol information and known instruments, identify which instrument is being used for the domain: {domain}
+    
+    Protocol information:
+    {protocol_context}
+    
+    Known instruments for this domain:
+    {excel_context}
+    
+    Respond with only the name of the identified instrument. If you cannot identify a specific instrument, respond with "Not identified".
+    """
+    
+    instrument = ChatOpenAI(model_name=INSTRUMENT_SEARCH_LLM, temperature=0).invoke(
+        [HumanMessage(content=prompt)]
+    ).content
+    
+    return {
+        "domain": domain,
+        "instrument": instrument.strip(),
+        "context": protocol_context
+    }
+
+@tool
 def analyze_all_heal_domains() -> str:
     """Analyze all NIH HEAL CDE core domains and identify instruments used in the protocol.
     
@@ -508,6 +595,25 @@ def analyze_all_heal_domains() -> str:
     return result
 
 @tool
+def analyze_all_domains() -> str:
+    """Analyze all NIH HEAL CDE core domains at once"""
+    results = []
+    
+    for domain in NIH_HEAL_CORE_DOMAINS:
+        result = analyze_domain(domain)
+        results.append(result)
+    
+    # Format as markdown table
+    markdown = "# NIH HEAL CDE Core Domains Analysis\n\n"
+    markdown += "| Domain | Protocol Instrument |\n"
+    markdown += "|--------|--------------------|\n"
+    
+    for result in results:
+        markdown += f"| {result['domain']} | {result['instrument']} |\n"
+    
+    return markdown
+
+@tool
 def format_instrument_analysis(analysis_results: list, title: str = "NIH HEAL CDE Core Domains Analysis") -> str:
     """Format instrument analysis results into a markdown table.
     
@@ -530,21 +636,25 @@ def format_instrument_analysis(analysis_results: list, title: str = "NIH HEAL CD
     
     return result
 
-# Update the tools list
+# Collect all tools
 tools = [
+    search_data,
     search_excel_data,
     load_and_embed_protocol_pdf,
     search_protocol, 
     search_protocol_for_instruments, 
+    analyze_domain,
     analyze_all_heal_domains,
+    analyze_all_domains,
     format_instrument_analysis
 ]
 
+# ==================== LANGGRAPH SETUP ====================
 # LangGraph components
 model = ChatOpenAI(model_name=INSTRUMENT_ANALYSIS_LLM, temperature=0)
 final_model = ChatOpenAI(model_name=INSTRUMENT_ANALYSIS_LLM, temperature=0)
 
-# Update the system message
+# System message
 system_message = """You are a helpful assistant specializing in NIH HEAL CDE protocols.
 
 You have access to:
@@ -621,7 +731,7 @@ builder.add_edge("final", END)
 
 graph = builder.compile()
 
-# Chainlit handlers
+# ==================== CHAINLIT HANDLERS ====================
 @cl.on_chat_start
 async def on_chat_start():
     # Welcome message
@@ -701,4 +811,5 @@ async def on_message(msg: cl.Message):
             await final_answer.stream_token(msg_response.content)
 
     await final_answer.send()
+
 
