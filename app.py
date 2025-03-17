@@ -34,9 +34,15 @@ load_dotenv()
 UPLOAD_PATH = "./uploads"
 INITIAL_EMBEDDINGS_DIR = "./initial_embeddings"
 INITIAL_EMBEDDINGS_NAME = "initial_embeddings"
-XLSX_MODEL_ID = "Snowflake/snowflake-arctic-embed-m"
-PDF_MODEL_ID = "Snowflake/snowflake-arctic-embed-m"
 USER_EMBEDDINGS_NAME = "user_embeddings"
+
+#XLSX_MODEL_ID = "Snowflake/snowflake-arctic-embed-m"
+#XLSX_MODEL_ID = "text-embedding-3-small"
+XLSX_MODEL_ID = "pritamdeka/S-PubMedBert-MS-MARCO"
+#PDF_MODEL_ID = "Snowflake/snowflake-arctic-embed-m"
+#PDF_MODEL_ID = "text-embedding-3-small"
+PDF_MODEL_ID = "pritamdeka/S-PubMedBert-MS-MARCO"
+
 
 # Make sure upload directory exists
 os.makedirs(UPLOAD_PATH, exist_ok=True)
@@ -60,6 +66,19 @@ qdrant_client = QdrantClient(":memory:")
 
 # Create a semantic splitter for PDF documents
 semantic_splitter = RecursiveCharacterTextSplitter(chunk_size=512, chunk_overlap=50)
+
+
+# Add this utility function after the other utility functions
+def get_embedding_model(model_id):
+    """Creates and returns the appropriate embedding model based on the model ID."""
+    if "text-embedding" in model_id:
+        # OpenAI embeddings
+        from langchain_openai import OpenAIEmbeddings
+        return OpenAIEmbeddings(model=model_id)
+    else:
+        # HuggingFace embeddings
+        return HuggingFaceEmbeddings(model_name=model_id)
+
 
 # Utility functions
 def load_and_chunk_excel_files():
@@ -100,7 +119,16 @@ def embed_chunks_in_qdrant(chunks):
         print("No Excel files found to process or all files were empty.")
         return None
 
-    xlsx_model = HuggingFaceEmbeddings(model_name=XLSX_MODEL_ID)
+    # Create embeddings model based on the configured model ID
+    if "text-embedding" in XLSX_MODEL_ID:
+        # OpenAI embeddings
+        from langchain_openai import OpenAIEmbeddings
+        xlsx_model = OpenAIEmbeddings(model=XLSX_MODEL_ID)
+    else:
+        # HuggingFace embeddings
+        xlsx_model = HuggingFaceEmbeddings(model_name=XLSX_MODEL_ID)
+    
+    print(f"Using embedding model: {XLSX_MODEL_ID}")
     print("Creating vector store...")
     vector_store = QdrantVectorStore.from_documents(
         documents=chunks,
@@ -151,6 +179,14 @@ async def load_and_chunk_pdf_files(files):
     
     return documents_with_metadata
 
+# Add this utility function to get vector dimensions
+def get_embedding_dimensions(model_id):
+    """Gets the dimensions of embeddings from a specific model."""
+    model = get_embedding_model(model_id)
+    sample_text = "Sample text to determine embedding dimension"
+    sample_embedding = model.embed_query(sample_text)
+    return len(sample_embedding)
+
 async def embed_pdf_chunks_in_qdrant(documents_with_metadata, model_name=PDF_MODEL_ID):
     """Create a vector store and embed PDF chunks into Qdrant."""
     if not documents_with_metadata:
@@ -158,7 +194,8 @@ async def embed_pdf_chunks_in_qdrant(documents_with_metadata, model_name=PDF_MOD
         return None
         
     # Create a new embeddings model
-    pdf_model = HuggingFaceEmbeddings(model_name=model_name)
+    pdf_model = get_embedding_model(model_name)
+    print(f"Using embedding model: {model_name}")
     
     try:
         # First, check if collection exists and delete it if it does
@@ -262,10 +299,11 @@ def search_excel_data(query: str, top_k: int = 3) -> str:
     
     # If we have a user collection, also search that
     try:
+        # Use the same model that was used to create the collection
         user_vectorstore = QdrantVectorStore(
             client=qdrant_client,
             collection_name=USER_EMBEDDINGS_NAME,
-            embedding=HuggingFaceEmbeddings(model_name=XLSX_MODEL_ID)
+            embedding=get_embedding_model(PDF_MODEL_ID)  # Use PDF_MODEL_ID here
         )
         
         # Create a retrieval chain for user documents
@@ -284,6 +322,7 @@ def search_excel_data(query: str, top_k: int = 3) -> str:
         # Combine results
         return f"From Excel files:\n{result}\n\nFrom your uploaded PDF:\n{user_result}"
     except Exception as e:
+        print(f"Error searching user vector store: {str(e)}")
         # If no user collection exists yet, just return Excel results
         return result
 
@@ -308,7 +347,7 @@ def identify_heal_instruments(protocol_text: str = "") -> str:
         user_vectorstore = QdrantVectorStore(
             client=qdrant_client,
             collection_name=USER_EMBEDDINGS_NAME,
-            embedding=HuggingFaceEmbeddings(model_name=XLSX_MODEL_ID)
+            embedding=get_embedding_model(PDF_MODEL_ID)  # Use PDF_MODEL_ID here
         )
         user_retriever = user_vectorstore.as_retriever(search_kwargs={"k": 10})
     except Exception as e:
@@ -522,3 +561,4 @@ async def on_message(msg: cl.Message):
             await final_answer.stream_token(msg_response.content)
 
     await final_answer.send()
+
