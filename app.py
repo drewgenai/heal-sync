@@ -28,6 +28,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from operator import itemgetter
 from langchain_core.output_parsers import StrOutputParser
+from langchain_experimental.text_splitter import SemanticChunker
 
 # Load environment variables
 load_dotenv()
@@ -100,7 +101,9 @@ def create_session_qdrant_client():
 
 # ==================== DOCUMENT PROCESSING ====================
 # Create a semantic splitter for documents
-semantic_splitter = RecursiveCharacterTextSplitter(chunk_size=512, chunk_overlap=50)
+semantic_splitter = SemanticChunker(embedding_model, add_start_index=True, buffer_size=30)
+# Keep the recursive splitter as a fallback option
+recursive_splitter = RecursiveCharacterTextSplitter(chunk_size=512, chunk_overlap=50)
 
 def format_docs(docs):
     """Format a list of documents into a single string."""
@@ -252,22 +255,26 @@ async def load_and_chunk_protocol_files(files):
             loader = PyMuPDFLoader(file_path)
             documents = loader.load()
             
+            # Add source filename to metadata for all documents
             for doc in documents:
-                source_name = file.name
-                chunks = semantic_splitter.split_text(doc.page_content)
-                for chunk in chunks:
-                    doc_chunk = Document(
-                        page_content=chunk, 
-                        metadata={
-                            "source": source_name,
-                            "type": "pdf"  # Add document type
-                        }
-                    )
-                    documents_with_metadata.append(doc_chunk)
+                doc.metadata["source"] = file.name
+                doc.metadata["type"] = "pdf"
+            
+            # Use semantic_splitter.split_documents to preserve metadata
+            chunks = semantic_splitter.split_documents(documents)
+            documents_with_metadata.extend(chunks)
                     
-            print(f"Successfully processed {file.name}, extracted {len(documents_with_metadata)} chunks")
+            print(f"Successfully processed {file.name}, extracted {len(chunks)} chunks")
         except Exception as e:
             print(f"Error processing {file.name}: {str(e)}")
+            # Fallback to recursive splitter if semantic chunking fails
+            try:
+                print(f"Falling back to recursive character splitting for {file.name}")
+                chunks = recursive_splitter.split_documents(documents)
+                documents_with_metadata.extend(chunks)
+                print(f"Fallback successful, extracted {len(chunks)} chunks")
+            except Exception as fallback_error:
+                print(f"Fallback also failed: {str(fallback_error)}")
     
     return documents_with_metadata
 
