@@ -375,49 +375,49 @@ async def search_all_data(query: str, doc_type: str = None) -> str:
 
 @tool
 async def analyze_protocol_domains(export_csv: bool = True) -> str:
-    """Analyze all NIH HEAL CDE core domains and identify instruments used in the protocol.
-    
-    Args:
-        export_csv: Whether to also export results to a CSV file
-        
-    Returns:
-        Markdown formatted table of domains and identified instruments
-    """
+    """Analyze all NIH HEAL CDE core domains and identify instruments used in the protocol(s)."""
     # Check if protocol document exists
     session_qdrant_client = cl.user_session.get("session_qdrant_client")
     if not session_qdrant_client or USER_EMBEDDINGS_NAME not in [c.name for c in session_qdrant_client.get_collections().collections]:
         return "No protocol document has been uploaded yet."
     
-    # Get the name of the uploaded protocol file from the user session
-    protocol_name = cl.user_session.get("protocol_filename", "Unknown Protocol")
-    
-    # For each domain, search for relevant instruments
-    domain_analysis_results = []
+    # Get the names of the uploaded protocol files from the user session
+    protocol_names = cl.user_session.get("protocol_filenames", ["Unknown Protocol"])
     
     # Use asyncio.gather to run all domain searches in parallel
     import asyncio
     tasks = [_search_protocol_for_instruments(domain) for domain in NIH_HEAL_CORE_DOMAINS]
     results = await asyncio.gather(*tasks)
     
-    for domain, result in zip(NIH_HEAL_CORE_DOMAINS, results):
-        print(f"Identified instrument for {domain}: {result['instrument']}")
-        
-        # Add the result to our list of analysis results
-        domain_analysis_results.append({
-            "domain": domain,
-            "instrument": result["instrument"]
-        })
-    
     # Format the results as a markdown table
     title = "NIH HEAL CDE Core Domains Analysis"
     result = f"# {title}\n\n"
-    result += f"| Domain | Protocol Instrument - {protocol_name} |\n"
-    result += "|--------|" + "-" * (len(protocol_name) + 23) + "|\n"
     
-    for item in domain_analysis_results:
-        domain = item.get("domain", "Unknown")
-        instrument = item.get("instrument", "Not identified")
-        result += f"| {domain} | {instrument} |\n"
+    # Create header with all protocol names
+    result += "| Domain |"
+    for protocol_name in protocol_names:
+        result += f" Protocol Instrument - {protocol_name} |"
+    result += "\n|--------|"
+    for _ in protocol_names:
+        result += "-" * (len("Protocol Instrument - ") + 15) + "|"
+    result += "\n"
+    
+    # Process results and build table rows
+    for domain_result in results:
+        domain = domain_result["domain"]
+        instruments = domain_result.get("instruments", {})
+        
+        # Debug output
+        print(f"Domain: {domain}, Instruments: {instruments}")
+        
+        result += f"| {domain} |"
+        for protocol_name in protocol_names:
+            instrument = instruments.get(protocol_name, "Not identified")
+            # Clean up any trailing periods or whitespace
+            if isinstance(instrument, str):
+                instrument = instrument.strip().rstrip('.')
+            result += f" {instrument} |"
+        result += "\n"
     
     # Export to CSV if requested
     csv_path = None
@@ -433,29 +433,34 @@ async def analyze_protocol_domains(export_csv: bool = True) -> str:
         # Write the data to CSV
         try:
             with open(csv_path, 'w', newline='') as csvfile:
-                fieldnames = ['Domain', f'Protocol Instrument - {protocol_name}']
-                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                # Create fieldnames with all protocol names
+                fieldnames = ['Domain']
+                for protocol_name in protocol_names:
+                    fieldnames.append(f'Protocol Instrument - {protocol_name}')
                 
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                 writer.writeheader()
-                for item in domain_analysis_results:
-                    domain = item.get("domain", "Unknown")
-                    instrument = item.get("instrument", "Not identified")
-                    writer.writerow({
-                        'Domain': domain, 
-                        f'Protocol Instrument - {protocol_name}': instrument
-                    })
+                
+                for domain_result in results:
+                    domain = domain_result["domain"]
+                    instruments = domain_result.get("instruments", {})
+                    
+                    row = {'Domain': domain}
+                    for protocol_name in protocol_names:
+                        instrument = instruments.get(protocol_name, "Not identified")
+                        if isinstance(instrument, str):
+                            instrument = instrument.strip().rstrip('.')
+                        row[f'Protocol Instrument - {protocol_name}'] = instrument
+                    writer.writerow(row)
             
             # Store the CSV path in the user session
             cl.user_session.set("csv_path", csv_path)
-            
-            # No longer adding any note about the CSV file in the markdown output
             
         except Exception as e:
             result += f"\n\nError creating CSV file: {str(e)}"
     
     return result
 
-# Helper functions (not exposed as tools)
 async def _search_protocol_for_instruments(domain: str) -> dict:
     """Search the protocol for instruments related to a specific NIH HEAL CDE core domain."""
     global embedding_model
@@ -464,6 +469,9 @@ async def _search_protocol_for_instruments(domain: str) -> dict:
     session_qdrant_client = cl.user_session.get("session_qdrant_client")
     if not session_qdrant_client:
         return {"domain": domain, "instrument": "No session-specific Qdrant client found", "context": ""}
+    
+    # Get the names of the uploaded protocol files
+    protocol_names = cl.user_session.get("protocol_filenames", ["Unknown Protocol"])
     
     # Check if user collection exists
     try:
@@ -476,7 +484,7 @@ async def _search_protocol_for_instruments(domain: str) -> dict:
             client=session_qdrant_client,
             collection_name=USER_EMBEDDINGS_NAME,
             embedding=embedding_model
-        ).as_retriever(search_kwargs={"k": 10})
+        ).as_retriever(search_kwargs={"k": 20})  # Increase k to get more documents
     except Exception as e:
         print(f"Error accessing user vector store: {str(e)}")
         return {"domain": domain, "instrument": "Error accessing protocol", "context": str(e)}
@@ -484,43 +492,72 @@ async def _search_protocol_for_instruments(domain: str) -> dict:
     # Create the chat model with the specified model from constants
     domain_chat_model = ChatOpenAI(model_name=general_llm_model, temperature=0)
     
-    # Search for instruments related to this domain in the protocol
-    query = f"What instrument or measure is used for {domain} in the protocol?"
+    # Results for each protocol
+    protocol_results = {}
     
-    try:
-        # Retrieve relevant chunks from the protocol
-        docs = await user_retriever.ainvoke(query)
-        protocol_context = format_docs(docs)
-        
-        # Search for instruments in the core reference data that match this domain
-        core_reference_query = f"What are standard instruments or measures for {domain}?"
-        core_reference_instruments = await core_reference_retrieval_chain.ainvoke({"question": core_reference_query})
-        
-        # Use the model to identify the most likely instrument for this domain
-        prompt = f"""
-        Based on the protocol information and known instruments, identify which instrument is being used for the domain: {domain}
-        
-        Protocol information:
-        {protocol_context}
-        
-        Known instruments for this domain:
-        {core_reference_instruments}
-        
-        Respond with only the name of the identified instrument. If you cannot identify a specific instrument, respond with "Not identified".
-        """
-        
-        instrument = await domain_chat_model.ainvoke([HumanMessage(content=prompt)])
-        
-        # Return the results as a dictionary
-        return {
-            "domain": domain,
-            "instrument": instrument.content.strip(),
-            "context": protocol_context,
-            "known_instruments": core_reference_instruments
-        }
-    except Exception as e:
-        print(f"Error identifying instrument for {domain}: {str(e)}")
-        return {"domain": domain, "instrument": "Error during identification", "context": str(e)}
+    # Search for instruments in the core reference data that match this domain
+    core_reference_query = f"What are standard instruments or measures for {domain}?"
+    core_reference_instruments = await core_reference_retrieval_chain.ainvoke({"question": core_reference_query})
+    
+    # Process each protocol separately
+    for protocol_name in protocol_names:
+        try:
+            # Search for instruments related to this domain in this specific protocol
+            query = f"What instrument or measure is used for {domain} in the protocol named {protocol_name}?"
+            
+            # Retrieve relevant chunks from the protocol
+            docs = await user_retriever.ainvoke(query)
+            
+            # Filter documents to only include those from this protocol
+            protocol_docs = [doc for doc in docs if doc.metadata.get("source") == protocol_name]
+            
+            # If no documents match this protocol, try a more general search
+            if not protocol_docs:
+                print(f"No specific docs found for {protocol_name}, using all retrieved docs")
+                protocol_docs = docs
+            
+            protocol_context = format_docs(protocol_docs)
+            
+            # Use the model to identify the most likely instrument for this domain in this protocol
+            prompt = f"""
+            Based on the protocol information and known instruments, identify which instrument is being used for the domain: {domain} in the protocol: {protocol_name}
+            
+            Protocol information:
+            {protocol_context}
+            
+            Known instruments for this domain:
+            {core_reference_instruments}
+            
+            Respond with only the name of the identified instrument. If you cannot identify a specific instrument, respond with "Not identified".
+            """
+            
+            instrument = await domain_chat_model.ainvoke([HumanMessage(content=prompt)])
+            
+            # Store the result for this protocol
+            protocol_results[protocol_name] = {
+                "instrument": instrument.content.strip(),
+                "context": protocol_context
+            }
+            
+            print(f"For {domain} in {protocol_name}: {instrument.content.strip()}")
+            
+        except Exception as e:
+            print(f"Error identifying instrument for {domain} in {protocol_name}: {str(e)}")
+            protocol_results[protocol_name] = {
+                "instrument": "Error during identification",
+                "context": str(e)
+            }
+    
+    # Combine results into a single response
+    combined_instruments = {}
+    for protocol_name, result in protocol_results.items():
+        combined_instruments[protocol_name] = result["instrument"]
+    
+    return {
+        "domain": domain,
+        "instruments": combined_instruments,
+        "known_instruments": core_reference_instruments
+    }
 
 async def create_rag_chain(doc_type=None):
     """Create a RAG chain based on the document type."""
@@ -665,21 +702,23 @@ async def on_chat_start():
     cl.user_session.set("session_qdrant_client", session_qdrant_client)
     
     files = await cl.AskFileMessage(
-        content="Please upload a single NIH HEAL Protocol PDF file for analysis.",
+        content="Please upload one or more NIH HEAL Protocol PDF files for analysis.",
         accept=["application/pdf"],
-        max_files=1,
+        max_files=5,  # Allow up to 5 files
         max_size_mb=20,
         timeout=180,
     ).send()
-    if len(files) != 1:
-        await cl.Message("Error: You must upload exactly one PDF file.").send()
+    
+    if not files:
+        await cl.Message("Error: You must upload at least one PDF file.").send()
         return    
     
     if files:
-        # Store the filename in the user session
-        cl.user_session.set("protocol_filename", files[0].name)
+        # Store the filenames in the user session
+        protocol_filenames = [file.name for file in files]
+        cl.user_session.set("protocol_filenames", protocol_filenames)
         
-        processing_msg = cl.Message(content="Processing your protocol PDF file...")
+        processing_msg = cl.Message(content=f"Processing {len(files)} protocol PDF file(s)...")
         await processing_msg.send()
         
         # Process the uploaded files with the session-specific client
@@ -688,13 +727,13 @@ async def on_chat_start():
         
         if user_vectorstore:
             # Present options to the user instead of automatically running analysis
-            options_message = """
-Your protocol has been successfully processed! What would you like to do next?
+            options_message = f"""
+Your protocol(s) have been successfully processed! What would you like to do next?
 
-1. Ask questions about the uploaded protocol
-   (This will use RAG to answer questions about your protocol document)
+1. Ask questions about the uploaded protocol(s)
+   (This will use RAG to answer questions about your protocol document(s))
 
-2. Run a complete analysis of what core domain instruments are used in the uploaded protocol
+2. Run a complete analysis of what core domain instruments are used in the uploaded protocol(s)
    (This will identify instruments for each NIH HEAL CDE core domain, return the result in markdown, and also create a CSV file)
 
 Please let me know which option you'd like to proceed with, or feel free to ask any other questions.
@@ -702,7 +741,7 @@ Please let me know which option you'd like to proceed with, or feel free to ask 
             
             await cl.Message(content=options_message).send()
         else:
-            await cl.Message(content="There was an issue processing your PDF. Please try uploading again.").send()
+            await cl.Message(content="There was an issue processing your PDF(s). Please try uploading again.").send()
 
 @cl.on_message
 async def on_message(msg: cl.Message):
