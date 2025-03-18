@@ -320,7 +320,7 @@ async def process_uploaded_protocol(files, session_qdrant_client, model_name=EMB
     return await embed_protocol_in_qdrant(documents_with_metadata, session_qdrant_client, model_name)
 
 # ==================== RETRIEVAL FUNCTIONS ====================
-def retrieve_from_core(query, k=5):
+async def retrieve_from_core(query, k=5):
     """Retrieve documents from core reference database"""
     global core_retriever
     
@@ -331,11 +331,11 @@ def retrieve_from_core(query, k=5):
     # Override k if needed
     if k != 10:  # Assuming default k=10 was used when creating the retriever
         retriever = core_vectorstore.as_retriever(search_kwargs={"k": k})
-        return retriever.invoke(query)
+        return await retriever.ainvoke(query)
     
-    return core_retriever.invoke(query)
+    return await core_retriever.ainvoke(query)
 
-def retrieve_from_protocol(query, k=5):
+async def retrieve_from_protocol(query, k=5):
     """Retrieve documents from protocol database"""
     # Get the session-specific client
     session_qdrant_client = cl.user_session.get("session_qdrant_client")
@@ -361,20 +361,20 @@ def retrieve_from_protocol(query, k=5):
     
     # Create and use retriever
     protocol_retriever = protocol_vectorstore.as_retriever(search_kwargs={"k": k})
-    return protocol_retriever.invoke(query)
+    return await protocol_retriever.ainvoke(query)
 
 # ==================== TOOL DEFINITIONS ====================
 @tool
-def search_all_data(query: str, doc_type: str = None) -> str:
+async def search_all_data(query: str, doc_type: str = None) -> str:
     """Search all data or filter by document type (protocol/core_reference)"""
     try:
-        chain = create_rag_chain(doc_type)
-        return chain.invoke({"question": query})
+        chain = await create_rag_chain(doc_type)
+        return await chain.ainvoke({"question": query})
     except Exception as e:
         return f"Error searching data: {str(e)}"
 
 @tool
-def analyze_protocol_domains(export_csv: bool = True) -> str:
+async def analyze_protocol_domains(export_csv: bool = True) -> str:
     """Analyze all NIH HEAL CDE core domains and identify instruments used in the protocol.
     
     Args:
@@ -394,9 +394,12 @@ def analyze_protocol_domains(export_csv: bool = True) -> str:
     # For each domain, search for relevant instruments
     domain_analysis_results = []
     
-    for domain in NIH_HEAL_CORE_DOMAINS:
-        # Search for instruments related to this domain in the protocol
-        result = _search_protocol_for_instruments(domain)
+    # Use asyncio.gather to run all domain searches in parallel
+    import asyncio
+    tasks = [_search_protocol_for_instruments(domain) for domain in NIH_HEAL_CORE_DOMAINS]
+    results = await asyncio.gather(*tasks)
+    
+    for domain, result in zip(NIH_HEAL_CORE_DOMAINS, results):
         print(f"Identified instrument for {domain}: {result['instrument']}")
         
         # Add the result to our list of analysis results
@@ -453,7 +456,7 @@ def analyze_protocol_domains(export_csv: bool = True) -> str:
     return result
 
 # Helper functions (not exposed as tools)
-def _search_protocol_for_instruments(domain: str) -> dict:
+async def _search_protocol_for_instruments(domain: str) -> dict:
     """Search the protocol for instruments related to a specific NIH HEAL CDE core domain."""
     global embedding_model
     
@@ -486,12 +489,12 @@ def _search_protocol_for_instruments(domain: str) -> dict:
     
     try:
         # Retrieve relevant chunks from the protocol
-        docs = user_retriever.invoke(query)
+        docs = await user_retriever.ainvoke(query)
         protocol_context = format_docs(docs)
         
         # Search for instruments in the core reference data that match this domain
         core_reference_query = f"What are standard instruments or measures for {domain}?"
-        core_reference_instruments = core_reference_retrieval_chain.invoke({"question": core_reference_query})
+        core_reference_instruments = await core_reference_retrieval_chain.ainvoke({"question": core_reference_query})
         
         # Use the model to identify the most likely instrument for this domain
         prompt = f"""
@@ -506,12 +509,12 @@ def _search_protocol_for_instruments(domain: str) -> dict:
         Respond with only the name of the identified instrument. If you cannot identify a specific instrument, respond with "Not identified".
         """
         
-        instrument = domain_chat_model.invoke([HumanMessage(content=prompt)]).content
+        instrument = await domain_chat_model.ainvoke([HumanMessage(content=prompt)])
         
         # Return the results as a dictionary
         return {
             "domain": domain,
-            "instrument": instrument.strip(),
+            "instrument": instrument.content.strip(),
             "context": protocol_context,
             "known_instruments": core_reference_instruments
         }
@@ -519,7 +522,7 @@ def _search_protocol_for_instruments(domain: str) -> dict:
         print(f"Error identifying instrument for {domain}: {str(e)}")
         return {"domain": domain, "instrument": "Error during identification", "context": str(e)}
 
-def create_rag_chain(doc_type=None):
+async def create_rag_chain(doc_type=None):
     """Create a RAG chain based on the document type."""
     # Get the session-specific Qdrant client
     session_qdrant_client = cl.user_session.get("session_qdrant_client")
@@ -580,7 +583,7 @@ def create_rag_chain(doc_type=None):
         else:
             retriever = retrievers[0]
     
-    # Create and return the RAG chain
+    # Create and return the RAG chain with async support
     return (
         {"context": itemgetter("question") | retriever | format_docs, 
          "question": itemgetter("question")}
@@ -629,12 +632,12 @@ def should_continue(state: MessagesState) -> Literal["tools", END]:
     # Otherwise, we end the graph (reply to the user)
     return END
 
-def call_model(state: MessagesState):
+async def call_model(state: MessagesState):
     messages = state["messages"]
     # Add the system message at the beginning of the messages list
     if messages and not any(isinstance(msg, SystemMessage) for msg in messages):
         messages = [SystemMessage(content=system_message)] + messages
-    response = model.invoke(messages)
+    response = await model.ainvoke(messages)
     # We return a list, because this will get added to the existing list
     return {"messages": [response]}
 
@@ -708,8 +711,8 @@ async def on_message(msg: cl.Message):
     # For all messages, use the graph to handle the logic
     final_answer = cl.Message(content="")
     
-    # Let the graph handle all message processing
-    for msg_response, metadata in graph.stream(
+    # Use astream instead of stream since we're using async functions
+    async for msg_response, metadata in graph.astream(
         {"messages": [HumanMessage(content=msg.content)]}, 
         stream_mode="messages", 
         config=config
