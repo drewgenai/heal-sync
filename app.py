@@ -377,12 +377,12 @@ def analyze_protocol_domains(export_csv: bool = True) -> str:
         Markdown formatted table of domains and identified instruments
     """
     # Check if protocol document exists
-    uploaded_files = [f for f in os.listdir(UPLOAD_PATH) if f.endswith('.pdf')]
-    if not uploaded_files:
+    session_qdrant_client = cl.user_session.get("session_qdrant_client")
+    if not session_qdrant_client or USER_EMBEDDINGS_NAME not in [c.name for c in session_qdrant_client.get_collections().collections]:
         return "No protocol document has been uploaded yet."
     
-    # Get the name of the uploaded protocol file
-    protocol_name = uploaded_files[0] if uploaded_files else "Unknown Protocol"
+    # Get the name of the uploaded protocol file from the user session
+    protocol_name = cl.user_session.get("protocol_filename", "Unknown Protocol")
     
     # For each domain, search for relevant instruments
     domain_analysis_results = []
@@ -666,6 +666,9 @@ async def on_chat_start():
         return    
     
     if files:
+        # Store the filename in the user session
+        cl.user_session.set("protocol_filename", files[0].name)
+        
         processing_msg = cl.Message(content="Processing your protocol PDF file...")
         await processing_msg.send()
         
