@@ -52,8 +52,8 @@ os.makedirs(UPLOAD_PATH, exist_ok=True)
 # Model IDs
 EMBEDDING_MODEL_ID = "pritamdeka/S-PubMedBert-MS-MARCO"
 #EMBEDDING_MODEL_ID = "Snowflake/snowflake-arctic-embed-m"
-INSTRUMENT_SEARCH_LLM = "gpt-4o"  # LLM for searching instruments
-INSTRUMENT_ANALYSIS_LLM = "gpt-4o"  # LLM for analyzing all domains
+general_llm_model = "gpt-4o"
+chat_model = ChatOpenAI(model_name=general_llm_model)
 
 # NIH HEAL CDE core domains
 NIH_HEAL_CORE_DOMAINS = [
@@ -205,7 +205,7 @@ Context:
 """
 
 rag_prompt = ChatPromptTemplate.from_template(RAG_TEMPLATE)
-chat_model = ChatOpenAI(model_name="gpt-4o")
+
 
 # Initialize core embeddings on application startup
 core_vectorstore = None
@@ -479,7 +479,7 @@ def _search_protocol_for_instruments(domain: str) -> dict:
         return {"domain": domain, "instrument": "Error accessing protocol", "context": str(e)}
     
     # Create the chat model with the specified model from constants
-    domain_chat_model = ChatOpenAI(model_name=INSTRUMENT_SEARCH_LLM, temperature=0)
+    domain_chat_model = ChatOpenAI(model_name=general_llm_model, temperature=0)
     
     # Search for instruments related to this domain in the protocol
     query = f"What instrument or measure is used for {domain} in the protocol?"
@@ -597,7 +597,7 @@ tools = [
 
 # ==================== LANGGRAPH SETUP ====================
 # LangGraph components
-model = ChatOpenAI(model_name=INSTRUMENT_ANALYSIS_LLM, temperature=0)
+model = ChatOpenAI(model_name=general_llm_model, temperature=0)
 
 # System message
 system_message = """You are a helpful assistant specializing in NIH HEAL CDE protocols.
