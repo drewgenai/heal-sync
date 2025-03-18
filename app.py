@@ -31,12 +31,12 @@ from langchain_core.output_parsers import StrOutputParser
 
 # Load environment variables
 load_dotenv()
-#####langsmith
+#####LangSmith uncomment block for LangSmith tracing
 # import uuid
 # os.environ["LANGCHAIN_PROJECT"] = f"HEAL-SYNC - {uuid.uuid4().hex[0:8]}"
 # os.environ["LANGCHAIN_TRACING_V2"] = "true"
 # print(os.environ["LANGCHAIN_PROJECT"])
-###########langsmith
+###########LangSmith
 
 
 # ==================== CONSTANTS ====================
@@ -45,7 +45,8 @@ UPLOAD_PATH = "./uploads"
 INITIAL_EMBEDDINGS_DIR = "./initial_embeddings"
 INITIAL_EMBEDDINGS_NAME = "initial_embeddings"
 USER_EMBEDDINGS_NAME = "user_embeddings"
-# VECTOR_STORE_COLLECTION = "documents"
+
+os.makedirs(UPLOAD_PATH, exist_ok=True)
 
 # Model IDs
 EMBEDDING_MODEL_ID = "pritamdeka/S-PubMedBert-MS-MARCO"
@@ -67,8 +68,6 @@ NIH_HEAL_CORE_DOMAINS = [
     "Substance Use Screener"
 ]
 
-# Make sure upload directory exists
-os.makedirs(UPLOAD_PATH, exist_ok=True)
 
 # ==================== EMBEDDING MODEL SETUP to allow flexibility of model selection ====================
 def get_embedding_model(model_id):
@@ -129,7 +128,7 @@ def load_and_chunk_core_reference_files():
                 for chunk in chunks:
                     chunk.metadata = chunk.metadata or {}
                     chunk.metadata["filename"] = file
-                    chunk.metadata["type"] = "excel"  # Add document type
+                    chunk.metadata["type"] = "excel"
                 
                 all_chunks.extend(chunks)
                 file_count += 1
@@ -149,7 +148,7 @@ def embed_core_reference_in_qdrant(chunks):
         print("No Excel files found to process or all files were empty.")
         return None
 
-    # Ensure we have a valid embedding model
+    # Ensure embedding model is valid
     if embedding_model is None:
         print("ERROR: No embedding model available. Initializing now.")
         initialize_embedding_models()
@@ -224,7 +223,7 @@ def initialize_core_reference_embeddings():
         
     return core_vectorstore
 
-# Call this function when the application starts
+# Initialize core reference embeddings
 core_vectorstore = initialize_core_reference_embeddings()
 
 # Chain for retrieving from core reference embeddings

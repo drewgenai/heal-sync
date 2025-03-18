@@ -1,0 +1,4 @@
+# Required
+OPENAI_API_KEY=
+# If you want to use langsmith tracing, uncomment and add your key
+LANGCHAIN_API_KEY=
