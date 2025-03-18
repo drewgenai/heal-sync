@@ -1,4 +1,6 @@
 import os
+import csv
+
 from typing import Annotated, Literal
 from typing_extensions import TypedDict
 
@@ -30,10 +32,10 @@ from langchain_core.output_parsers import StrOutputParser
 # Load environment variables
 load_dotenv()
 #####langsmith
-import uuid
-os.environ["LANGCHAIN_PROJECT"] = f"HEAL-SYNC - {uuid.uuid4().hex[0:8]}"
-os.environ["LANGCHAIN_TRACING_V2"] = "true"
-print(os.environ["LANGCHAIN_PROJECT"])
+# import uuid
+# os.environ["LANGCHAIN_PROJECT"] = f"HEAL-SYNC - {uuid.uuid4().hex[0:8]}"
+# os.environ["LANGCHAIN_TRACING_V2"] = "true"
+# print(os.environ["LANGCHAIN_PROJECT"])
 ###########langsmith
 
 
@@ -366,120 +368,86 @@ def search_all_data(query: str, doc_type: str = None) -> str:
         return f"Error searching data: {str(e)}"
 
 @tool
-def search_core_reference(query: str, top_k: int = 3) -> str:
-    """Search core reference data and protocol data for information related to the query."""
-    global embedding_model, global_qdrant_client
+def analyze_protocol_domains(export_csv: bool = True) -> str:
+    """Analyze all NIH HEAL CDE core domains and identify instruments used in the protocol.
     
-    # Create a retriever for the core embeddings
-    core_retriever = QdrantVectorStore(
-        client=global_qdrant_client,
-        collection_name=INITIAL_EMBEDDINGS_NAME,
-        embedding=embedding_model
-    ).as_retriever(search_kwargs={"k": top_k})
+    Args:
+        export_csv: Whether to also export results to a CSV file
+        
+    Returns:
+        Markdown formatted table of domains and identified instruments
+    """
+    # Check if protocol document exists
+    uploaded_files = [f for f in os.listdir(UPLOAD_PATH) if f.endswith('.pdf')]
+    if not uploaded_files:
+        return "No protocol document has been uploaded yet."
     
-    # Create a retrieval chain for core documents
-    core_retrieval_chain = (
-        {"context": itemgetter("question") | core_retriever | format_docs, 
-         "question": itemgetter("question")}
-        | rag_prompt 
-        | chat_model
-        | StrOutputParser()
-    )
+    # Get the name of the uploaded protocol file
+    protocol_name = uploaded_files[0] if uploaded_files else "Unknown Protocol"
     
-    # Get results from core reference
-    result = core_retrieval_chain.invoke({"question": query})
+    # For each domain, search for relevant instruments
+    domain_analysis_results = []
     
-    # Get the session-specific Qdrant client
-    session_qdrant_client = cl.user_session.get("session_qdrant_client")
-    if not session_qdrant_client:
-        return result  # Return only core results if no session client
+    for domain in NIH_HEAL_CORE_DOMAINS:
+        # Search for instruments related to this domain in the protocol
+        result = _search_protocol_for_instruments(domain)
+        print(f"Identified instrument for {domain}: {result['instrument']}")
+        
+        # Add the result to our list of analysis results
+        domain_analysis_results.append({
+            "domain": domain,
+            "instrument": result["instrument"]
+        })
     
-    # If we have a user collection, also search that
-    try:
-        # Check if user collection exists
-        if USER_EMBEDDINGS_NAME not in [c.name for c in session_qdrant_client.get_collections().collections]:
-            # If no user collection exists yet, just return core reference results
-            return result
+    # Format the results as a markdown table
+    title = "NIH HEAL CDE Core Domains Analysis"
+    result = f"# {title}\n\n"
+    result += f"| Domain | Protocol Instrument - {protocol_name} |\n"
+    result += "|--------|" + "-" * (len(protocol_name) + 23) + "|\n"
+    
+    for item in domain_analysis_results:
+        domain = item.get("domain", "Unknown")
+        instrument = item.get("instrument", "Not identified")
+        result += f"| {domain} | {instrument} |\n"
+    
+    # Export to CSV if requested
+    csv_path = None
+    if export_csv:
+        # Create output directory if it doesn't exist
+        output_dir = "./outputs"
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Full path for the CSV file
+        filename = "domain_analysis.csv"
+        csv_path = os.path.join(output_dir, filename)
+        
+        # Write the data to CSV
+        try:
+            with open(csv_path, 'w', newline='') as csvfile:
+                fieldnames = ['Domain', f'Protocol Instrument - {protocol_name}']
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                
+                writer.writeheader()
+                for item in domain_analysis_results:
+                    domain = item.get("domain", "Unknown")
+                    instrument = item.get("instrument", "Not identified")
+                    writer.writerow({
+                        'Domain': domain, 
+                        f'Protocol Instrument - {protocol_name}': instrument
+                    })
             
-        # Create a retrieval chain for user documents
-        user_retriever = QdrantVectorStore(
-            client=session_qdrant_client,
-            collection_name=USER_EMBEDDINGS_NAME,
-            embedding=embedding_model
-        ).as_retriever(search_kwargs={"k": top_k})
-        
-        user_retrieval_chain = (
-            {"context": itemgetter("question") | user_retriever | format_docs, 
-             "question": itemgetter("question")}
-            | rag_prompt 
-            | chat_model
-            | StrOutputParser()
-        )
-        
-        user_result = user_retrieval_chain.invoke({"question": query})
-        
-        # Combine results
-        return f"From core reference files:\n{result}\n\nFrom your uploaded PDF:\n{user_result}"
-    except Exception as e:
-        print(f"Error searching user vector store: {str(e)}")
-        # If error occurs, just return core reference results
-        return result
-
-@tool
-def load_and_embed_protocol(file_path: str = None) -> str:
-    """Load and embed a protocol PDF file into the vector store."""
-    # Get the session-specific Qdrant client
-    session_qdrant_client = cl.user_session.get("session_qdrant_client")
-    if not session_qdrant_client:
-        return "No session-specific Qdrant client found. Please restart the chat."
-    
-    # If no specific file path is provided, use all PDFs in the upload directory
-    if not file_path:
-        uploaded_files = [f for f in os.listdir(UPLOAD_PATH) if f.endswith('.pdf')]
-        if not uploaded_files:
-            return "No protocol documents found in the upload directory."
-        
-        # Create file objects for processing
-        files = []
-        for filename in uploaded_files:
-            file_path = os.path.join(UPLOAD_PATH, filename)
-            # Create a simple object with the necessary attributes
-            class FileObj:
-                def __init__(self, path, name, size):
-                    self.path = path
-                    self.name = name
-                    self.size = size
+            # Store the CSV path in the user session
+            cl.user_session.set("csv_path", csv_path)
             
-            file_size = os.path.getsize(file_path)
-            files.append(FileObj(file_path, filename, file_size))
-    else:
-        # Create a file object for the specific file
-        if not os.path.exists(file_path):
-            return f"File not found: {file_path}"
-        
-        filename = os.path.basename(file_path)
-        file_size = os.path.getsize(file_path)
-        
-        class FileObj:
-            def __init__(self, path, name, size):
-                self.path = path
-                self.name = name
-                self.size = size
-        
-        files = [FileObj(file_path, filename, file_size)]
+            # No longer adding any note about the CSV file in the markdown output
+            
+        except Exception as e:
+            result += f"\n\nError creating CSV file: {str(e)}"
     
-    # Process the files asynchronously
-    import asyncio
-    documents_with_metadata = asyncio.run(load_and_chunk_protocol_files(files))
-    user_vectorstore = asyncio.run(embed_protocol_in_qdrant(documents_with_metadata, session_qdrant_client, EMBEDDING_MODEL_ID))
-    
-    if user_vectorstore:
-        return f"Successfully embedded {len(documents_with_metadata)} chunks from {len(files)} protocol document(s)."
-    else:
-        return "Failed to embed protocol document(s)."
+    return result
 
-@tool
-def search_protocol_for_instruments(domain: str) -> dict:
+# Helper functions (not exposed as tools)
+def _search_protocol_for_instruments(domain: str) -> dict:
     """Search the protocol for instruments related to a specific NIH HEAL CDE core domain."""
     global embedding_model
     
@@ -545,108 +513,115 @@ def search_protocol_for_instruments(domain: str) -> dict:
         print(f"Error identifying instrument for {domain}: {str(e)}")
         return {"domain": domain, "instrument": "Error during identification", "context": str(e)}
 
-@tool
-def analyze_protocol_domains() -> list:
-    """Analyze all NIH HEAL CDE core domains and identify instruments used in the protocol."""
-    # Check if protocol document exists
-    uploaded_files = [f for f in os.listdir(UPLOAD_PATH) if f.endswith('.pdf')]
-    if not uploaded_files:
-        return "No protocol document has been uploaded yet."
+def create_rag_chain(doc_type=None):
+    """Create a RAG chain based on the document type."""
+    # Get the session-specific Qdrant client
+    session_qdrant_client = cl.user_session.get("session_qdrant_client")
     
-    # For each domain, search for relevant instruments
-    domain_analysis_results = []
-    
-    for domain in NIH_HEAL_CORE_DOMAINS:
-        # Use the search_protocol_for_instruments tool to get results for each domain
-        result = search_protocol_for_instruments(domain)
-        print(f"Identified instrument for {domain}: {result['instrument']}")
+    # Create retrievers based on document type
+    if doc_type == "protocol" and session_qdrant_client:
+        # Check if user collection exists
+        try:
+            if USER_EMBEDDINGS_NAME in [c.name for c in session_qdrant_client.get_collections().collections]:
+                protocol_vectorstore = QdrantVectorStore(
+                    client=session_qdrant_client,
+                    collection_name=USER_EMBEDDINGS_NAME,
+                    embedding=embedding_model
+                )
+                retriever = protocol_vectorstore.as_retriever(search_kwargs={"k": 5})
+            else:
+                raise ValueError("No protocol document embedded")
+        except Exception as e:
+            raise ValueError(f"Error accessing protocol: {str(e)}")
+    elif doc_type == "core_reference":
+        if core_vectorstore:
+            retriever = core_vectorstore.as_retriever(search_kwargs={"k": 5})
+        else:
+            raise ValueError("Core reference data not available")
+    else:
+        # Default: search both if available
+        retrievers = []
         
-        # Add the result to our list of analysis results
-        domain_analysis_results.append({
-            "domain": domain,
-            "instrument": result["instrument"]
-        })
-    
-    # Return the raw analysis results instead of formatting them
-    return domain_analysis_results
-
-@tool
-def format_domain_analysis(analysis_results: list, title: str = "NIH HEAL CDE Core Domains Analysis") -> str:
-    """Format domain analysis results into a markdown table.
-        Args:
-        analysis_results: List of dictionaries with domain and instrument information
-        title: Title for the markdown output
+        # Add core reference retriever if available
+        if core_vectorstore:
+            core_retriever = core_vectorstore.as_retriever(search_kwargs={"k": 3})
+            retrievers.append(core_retriever)
         
-    Returns:
-        Markdown formatted table of domains and identified instruments
-    """
-    # Get the name of the uploaded protocol file
-    uploaded_files = [f for f in os.listdir(UPLOAD_PATH) if f.endswith('.pdf')]
-    protocol_name = uploaded_files[0] if uploaded_files else "Unknown Protocol"
+        # Add protocol retriever if available
+        if session_qdrant_client:
+            try:
+                if USER_EMBEDDINGS_NAME in [c.name for c in session_qdrant_client.get_collections().collections]:
+                    protocol_vectorstore = QdrantVectorStore(
+                        client=session_qdrant_client,
+                        collection_name=USER_EMBEDDINGS_NAME,
+                        embedding=embedding_model
+                    )
+                    protocol_retriever = protocol_vectorstore.as_retriever(search_kwargs={"k": 3})
+                    retrievers.append(protocol_retriever)
+            except Exception as e:
+                print(f"Error accessing protocol: {str(e)}")
+        
+        if not retrievers:
+            raise ValueError("No data sources available")
+        
+        # If we have multiple retrievers, use them in sequence
+        if len(retrievers) > 1:
+            from langchain.retrievers import EnsembleRetriever
+            retriever = EnsembleRetriever(
+                retrievers=retrievers,
+                weights=[1.0/len(retrievers)] * len(retrievers)
+            )
+        else:
+            retriever = retrievers[0]
     
-    # Format the results as a markdown table
-    result = f"# {title}\n\n"
-    result += f"| Domain | Protocol Instrument - {protocol_name} |\n"
-    result += "|--------|" + "-" * (len(protocol_name) + 23) + "|\n"
-    
-    for item in analysis_results:
-        domain = item.get("domain", "Unknown")
-        instrument = item.get("instrument", "Not identified")
-        result += f"| {domain} | {instrument} |\n"
-    
-    return result
+    # Create and return the RAG chain
+    return (
+        {"context": itemgetter("question") | retriever | format_docs, 
+         "question": itemgetter("question")}
+        | rag_prompt 
+        | chat_model
+        | StrOutputParser()
+    )
 
-# Collect all tools
+# Collect all tools - now just the two core tools
 tools = [
     search_all_data,
-    search_core_reference,
-    load_and_embed_protocol,
-    search_protocol_for_instruments, 
-    analyze_protocol_domains,
-    format_domain_analysis
+    analyze_protocol_domains
 ]
 
 # ==================== LANGGRAPH SETUP ====================
 # LangGraph components
 model = ChatOpenAI(model_name=INSTRUMENT_ANALYSIS_LLM, temperature=0)
-final_model = ChatOpenAI(model_name=INSTRUMENT_ANALYSIS_LLM, temperature=0)
 
 # System message
 system_message = """You are a helpful assistant specializing in NIH HEAL CDE protocols.
 
 You have access to:
-1. Core reference data through the search_core_reference tool
-2. A tool to load and embed protocol PDFs (load_and_embed_protocol)
-3. A tool to search for instruments in protocols for specific domains (search_protocol_for_instruments)
-4. A tool to analyze all NIH HEAL domains at once (analyze_protocol_domains)
-5. A tool to format analysis results into a markdown table (format_domain_analysis)
-6. A tool to search all available data (search_all_data)
+1. A tool to search all available data (search_all_data) - Use this to answer questions about the protocol or core reference data
+2. A tool to analyze all NIH HEAL domains at once (analyze_protocol_domains) - This will identify instruments for each NIH HEAL CDE core domain, return the result in markdown, and also create a CSV file
 
 WHEN TO USE TOOLS:
-- When users upload a protocol PDF, use the load_and_embed_protocol tool.
-- When users ask general questions about the protocol, use the search_all_data tool.
-- When users ask about a specific instrument for a domain, use the search_protocol_for_instruments tool.
+- When users ask general questions about the protocol or core reference data, use the search_all_data tool.
 - When users want a complete analysis of all domains, use the analyze_protocol_domains tool.
-- When users ask about data or information in the core reference files, use the search_core_reference tool.
-- When you have multiple analysis results to present, use format_domain_analysis to create a nice table.
 
 Be specific in your tool queries to get the most relevant information.
 Always use the appropriate tool before responding to questions about the protocol or core reference data.
+
+IMPORTANT: When returning tool outputs, especially markdown tables or formatted content, preserve the exact formatting without adding any commentary, introduction, or conclusion.
 """
 
 # Bind tools and configure models
 model = model.bind_tools(tools)
-final_model = final_model.with_config(tags=["final_node"])
 tool_node = ToolNode(tools=tools)
 
-def should_continue(state: MessagesState) -> Literal["tools", "final"]:
+def should_continue(state: MessagesState) -> Literal["tools", END]:
     messages = state["messages"]
     last_message = messages[-1]
     # If the LLM makes a tool call, then we route to the "tools" node
     if last_message.tool_calls:
         return "tools"
-    # Otherwise, we stop (reply to the user)
-    return "final"
+    # Otherwise, we end the graph (reply to the user)
+    return END
 
 def call_model(state: MessagesState):
     messages = state["messages"]
@@ -657,35 +632,19 @@ def call_model(state: MessagesState):
     # We return a list, because this will get added to the existing list
     return {"messages": [response]}
 
-def call_final_model(state: MessagesState):
-    messages = state["messages"]
-    last_ai_message = messages[-1]
-    response = final_model.invoke(
-        [
-            #SystemMessage("Rewrite this in the voice of a helpful and kind assistant"),
-            SystemMessage("do not alter just present the information"),
-            HumanMessage(last_ai_message.content),
-        ]
-    )
-    # overwrite the last AI message from the agent
-    response.id = last_ai_message.id
-    return {"messages": [response]}
-
 # Build the graph
 builder = StateGraph(MessagesState)
 
-builder.add_node("agent", call_model)
+builder.add_node("supervisor", call_model)
 builder.add_node("tools", tool_node)
-builder.add_node("final", call_final_model)
 
-builder.add_edge(START, "agent")
+builder.add_edge(START, "supervisor")
 builder.add_conditional_edges(
-    "agent",
+    "supervisor",
     should_continue,
 )
 
-builder.add_edge("tools", "agent")
-builder.add_edge("final", END)
+builder.add_edge("tools", "supervisor")
 
 graph = builder.compile()
 
@@ -716,39 +675,26 @@ async def on_chat_start():
         user_vectorstore = await embed_protocol_in_qdrant(documents_with_metadata, session_qdrant_client)
         
         if user_vectorstore:
-            analysis_msg = cl.Message(content="Analyzing your protocol to identify instruments (CRF questionaires) for NIH HEAL CDE core domains...")
-            await analysis_msg.send()
+            # Present options to the user instead of automatically running analysis
+            options_message = """
+Your protocol has been successfully processed! What would you like to do next?
+
+1. Ask questions about the uploaded protocol
+   (This will use RAG to answer questions about your protocol document)
+
+2. Run a complete analysis of what core domain instruments are used in the uploaded protocol
+   (This will identify instruments for each NIH HEAL CDE core domain, return the result in markdown, and also create a CSV file)
+
+Please let me know which option you'd like to proceed with, or feel free to ask any other questions.
+            """
             
-            # Use the analyze_protocol_domains tool to analyze the protocol
-            config = {"configurable": {"thread_id": cl.context.session.id}}
-            
-            # Create a message to trigger the analysis
-            analysis_request = HumanMessage(content="Please analyze the uploaded protocol and identify instruments for each NIH HEAL CDE core domain.")
-            
-            final_answer = cl.Message(content="")
-            
-            for msg, metadata in graph.stream(
-                {"messages": [analysis_request]}, 
-                stream_mode="messages", 
-                config=config
-            ):
-                if (
-                    msg.content
-                    and not isinstance(msg, HumanMessage)
-                    and metadata["langgraph_node"] == "final"
-                ):
-                    await final_answer.stream_token(msg.content)
-            
-            await final_answer.send()
-            
-            await cl.Message(content="You can now ask questions about the protocol.").send()
+            await cl.Message(content=options_message).send()
         else:
             await cl.Message(content="There was an issue processing your PDF. Please try uploading again.").send()
 
 @cl.on_message
 async def on_message(msg: cl.Message):
     config = {"configurable": {"thread_id": cl.context.session.id}}
-
     
     # For all messages, use the graph to handle the logic
     final_answer = cl.Message(content="")
@@ -762,8 +708,28 @@ async def on_message(msg: cl.Message):
         if (
             msg_response.content
             and not isinstance(msg_response, HumanMessage)
-            and metadata["langgraph_node"] == "final"
+            and metadata["langgraph_node"] == "supervisor"
         ):
             await final_answer.stream_token(msg_response.content)
-
+    
     await final_answer.send()
+    
+    # Check if we need to attach a CSV file
+    csv_path = cl.user_session.get("csv_path")
+    if csv_path:
+        try:
+            # Create a message with the CSV file
+            file_message = cl.Message(content="Here's the CSV file with the analysis results:")
+            await file_message.send()
+            
+            # Now attach the file to this message
+            await cl.File(
+                name="domain_analysis.csv",
+                path=csv_path,
+                display="inline"
+            ).send(for_id=file_message.id)
+            
+            # Clear the path to avoid sending it multiple times
+            cl.user_session.set("csv_path", None)
+        except Exception as e:
+            print(f"Error attaching CSV file: {str(e)}")

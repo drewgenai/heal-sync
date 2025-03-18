@@ -4,6 +4,7 @@ __pycache__/
 .env
 /data
 /output/
+/outputs/
 /upload/
 /uploads/
 *.jsonl
