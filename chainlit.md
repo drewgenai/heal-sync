@@ -1,15 +1,13 @@
-# Document Comparison Tool
+# HEAL SYNC
 
-Welcome to Heal Sync! This application will help you link protocols to HEAL CDE 
+This system will read, extract, and present HEAL CDE information to your screen and in a downloadable crosswalk.
 
 ## How to use:
-1. Upload PDF file when prompted
+1. Upload your Protocol PDFs file(s) when prompted
 2. Ask questions about the document or request a comparison
 3. Download comparison results as needed
 
 ## Features:
-- Document analysis and question answering
-- Analyze what core domain instruments are used in the uploaded protocol
-- Export of comparison results to CSV
-
-Upload your documents to get started!
+- Document analysis and Interactive interface
+- Analyze what core domain instruments are used in the uploaded protocol(s)
+- Downloadloadable crosswalk

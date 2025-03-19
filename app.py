@@ -745,42 +745,55 @@ Please let me know which option you'd like to proceed with, or feel free to ask 
 
 @cl.on_message
 async def on_message(msg: cl.Message):
-    config = {"configurable": {"thread_id": cl.context.session.id}}
-    
-    # For all messages, use the graph to handle the logic
-    final_answer = cl.Message(content="")
-    
-    # Use astream instead of stream since we're using async functions
-    async for msg_response, metadata in graph.astream(
-        {"messages": [HumanMessage(content=msg.content)]}, 
-        stream_mode="messages", 
-        config=config
-    ):
-        if (
-            msg_response.content
-            and not isinstance(msg_response, HumanMessage)
-            and metadata["langgraph_node"] == "supervisor"
-        ):
-            await final_answer.stream_token(msg_response.content)
+    # Show a thinking indicator
+    with cl.Step("Heal-Sync to process your request"):
+        final_answer = await process_message(msg.content)
     
     await final_answer.send()
+    await handle_file_attachments()
+
+async def process_message(content: str):
+    config = {"configurable": {"thread_id": cl.context.session.id}}
+    final_answer = cl.Message(content="")
     
-    # Check if we need to attach a CSV file
+    try:
+        async for msg_response, metadata in graph.astream(
+            {"messages": [HumanMessage(content=content)]}, 
+            stream_mode="messages", 
+            config=config
+        ):
+            # Process response
+            if should_stream_response(msg_response, metadata):
+                await final_answer.stream_token(msg_response.content)
+    except Exception as e:
+        # Handle graph processing errors gracefully
+        await final_answer.stream_token(f"\n\nI encountered an error: {str(e)}")
+    
+    return final_answer
+
+def should_stream_response(msg_response, metadata):
+    return (
+        msg_response.content
+        and not isinstance(msg_response, HumanMessage)
+        and metadata["langgraph_node"] == "supervisor"
+    )
+
+async def handle_file_attachments():
     csv_path = cl.user_session.get("csv_path")
-    if csv_path:
-        try:
-            # Create a message with the CSV file
-            file_message = cl.Message(content="Here's the CSV file with the analysis results:")
-            await file_message.send()
-            
-            # Now attach the file to this message
-            await cl.File(
-                name="domain_analysis.csv",
-                path=csv_path,
-                display="inline"
-            ).send(for_id=file_message.id)
-            
-            # Clear the path to avoid sending it multiple times
-            cl.user_session.set("csv_path", None)
-        except Exception as e:
-            print(f"Error attaching CSV file: {str(e)}")
+    if not csv_path:
+        return
+        
+    try:
+        file_message = cl.Message(content="Here's the CSV file with the analysis results:")
+        await file_message.send()
+        
+        await cl.File(
+            name="domain_analysis.csv",
+            path=csv_path,
+            display="inline"
+        ).send(for_id=file_message.id)
+        
+        # Clear the path to avoid sending it multiple times
+        cl.user_session.set("csv_path", None)
+    except Exception as e:
+        print(f"Error attaching CSV file: {str(e)}")
