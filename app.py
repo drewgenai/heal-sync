@@ -702,7 +702,7 @@ async def on_chat_start():
     cl.user_session.set("session_qdrant_client", session_qdrant_client)
     
     files = await cl.AskFileMessage(
-        content="Please upload one or more NIH HEAL Protocol PDF files for analysis.",
+        content="Please upload one or more NIH HEAL Protocols (PDFs only) for analysis.",
         accept=["application/pdf"],
         max_files=5,  # Allow up to 5 files
         max_size_mb=20,
@@ -718,7 +718,7 @@ async def on_chat_start():
         protocol_filenames = [file.name for file in files]
         cl.user_session.set("protocol_filenames", protocol_filenames)
         
-        processing_msg = cl.Message(content=f"Processing {len(files)} protocol PDF file(s)...")
+        processing_msg = cl.Message(content=f"Processing {len(files)} protocol(s)...")
         await processing_msg.send()
         
         # Process the uploaded files with the session-specific client
@@ -731,12 +731,9 @@ async def on_chat_start():
 Your protocol(s) have been successfully processed! What would you like to do next?
 
 1. Ask questions about the uploaded protocol(s)
-   (This will use RAG to answer questions about your protocol document(s))
 
 2. Run a complete analysis of what core domain instruments are used in the uploaded protocol(s)
-   (This will identify instruments for each NIH HEAL CDE core domain, return the result in markdown, and also create a CSV file)
-
-Please let me know which option you'd like to proceed with, or feel free to ask any other questions.
+This will identify instruments for each NIH HEAL CDE core domain, return the result to your screen and create a downloadable crosswalk.
             """
             
             await cl.Message(content=options_message).send()
@@ -784,7 +781,7 @@ async def handle_file_attachments():
         return
         
     try:
-        file_message = cl.Message(content="Here's the CSV file with the analysis results:")
+        file_message = cl.Message(content="Download the crosswalk here:")
         await file_message.send()
         
         await cl.File(
