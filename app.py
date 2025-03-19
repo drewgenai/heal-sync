@@ -743,7 +743,7 @@ This will identify instruments for each NIH HEAL CDE core domain, return the res
 @cl.on_message
 async def on_message(msg: cl.Message):
     # Show a thinking indicator
-    with cl.Step("Heal-Sync to process your request"):
+    with cl.Step("Heal SYNC to process your request"):
         final_answer = await process_message(msg.content)
     
     await final_answer.send()
